@@ -12,8 +12,8 @@ func (tx *CallbackTransaction) Commit(callback TransactionCallback) error {
 
 	// Create COMMIT frame
 	commitFrame := frame.New(frame.COMMIT, frame.Transaction, tx.id)
-	writer := frame.NewWriter(tx.conn.ioAdapter)
-	err := writer.Write(commitFrame)
+	writer := frame.NewUnwrapCbioWriter(tx.conn.conn)
+	err := writer.WriteSync(commitFrame)
 	if err != nil {
 		// Notify error
 		if callback != nil {
@@ -47,8 +47,8 @@ func (tx *CallbackTransaction) Abort(callback TransactionCallback) error {
 
 	// Create ABORT frame
 	abortFrame := frame.New(frame.ABORT, frame.Transaction, tx.id)
-	writer := frame.NewWriter(tx.conn.ioAdapter)
-	err := writer.Write(abortFrame)
+	writer := frame.NewUnwrapCbioWriter(tx.conn.conn)
+	err := writer.WriteSync(abortFrame)
 	if err != nil {
 		// Notify error
 		if callback != nil {
@@ -97,8 +97,8 @@ func (tx *CallbackTransaction) Send(destination, contentType string, body []byte
 	f.Header.Set(frame.Transaction, tx.id)
 
 	// Send frame
-	writer := frame.NewWriter(tx.conn.ioAdapter)
-	err = writer.Write(f)
+	writer := frame.NewUnwrapCbioWriter(tx.conn.conn)
+	err = writer.WriteSync(f)
 	if err != nil {
 		if callback != nil {
 			go callback(tx.conn, destination, err)

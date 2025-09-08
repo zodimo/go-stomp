@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/go-stomp/stomp/v3/frame"
+	"github.com/zodimo/go-netkit/cbio"
 	. "gopkg.in/check.v1"
 )
 
@@ -39,6 +40,7 @@ func NewFakeConn() (client *FakeConn, server *FakeConn) {
 	return client, server
 }
 
+// Implement io.Reader interface
 func (f *FakeConn) Read(p []byte) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -48,6 +50,7 @@ func (f *FakeConn) Read(p []byte) (int, error) {
 	return f.reader.Read(p)
 }
 
+// Implement io.Writer interface
 func (f *FakeConn) Write(p []byte) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -81,7 +84,8 @@ func (f *FakeConn) Close() error {
 
 func (s *CallbackConnSuite) TestNewCallbackConn(c *C) {
 	client, _ := NewFakeConn()
-	conn := NewCallbackConn(client)
+	cbioClient := cbio.WrapReadWriteCloser(client)
+	conn := NewCallbackConn(cbioClient)
 
 	c.Assert(conn, NotNil)
 	c.Assert(conn.GetState(), Equals, Disconnected)
@@ -92,7 +96,8 @@ func (s *CallbackConnSuite) TestNewCallbackConn(c *C) {
 
 func (s *CallbackConnSuite) TestCallbackConnConnect(c *C) {
 	client, server := NewFakeConn()
-	conn := NewCallbackConn(client)
+	cbioClient := cbio.WrapReadWriteCloser(client)
+	conn := NewCallbackConn(cbioClient)
 
 	var connectResult struct {
 		session string
@@ -147,7 +152,8 @@ func (s *CallbackConnSuite) TestCallbackConnConnect(c *C) {
 
 func (s *CallbackConnSuite) TestCallbackConnDisconnect(c *C) {
 	client, server := NewFakeConn()
-	conn := NewCallbackConn(client)
+	cbioClient := cbio.WrapReadWriteCloser(client)
+	conn := NewCallbackConn(cbioClient)
 
 	var disconnectResult struct {
 		err    error
@@ -199,7 +205,8 @@ func (s *CallbackConnSuite) TestCallbackConnDisconnect(c *C) {
 
 func (s *CallbackConnSuite) TestCallbackConnStateChange(c *C) {
 	client, _ := NewFakeConn()
-	conn := NewCallbackConn(client)
+	cbioClient := cbio.WrapReadWriteCloser(client)
+	conn := NewCallbackConn(cbioClient)
 
 	var stateChanges []struct {
 		oldState ConnectionState
@@ -235,7 +242,8 @@ func (s *CallbackConnSuite) TestCallbackConnStateChange(c *C) {
 
 func (s *CallbackConnSuite) TestCallbackConnError(c *C) {
 	client, _ := NewFakeConn()
-	conn := NewCallbackConn(client)
+	cbioClient := cbio.WrapReadWriteCloser(client)
+	conn := NewCallbackConn(cbioClient)
 
 	var errorResult struct {
 		err    error
@@ -260,7 +268,8 @@ func (s *CallbackConnSuite) TestCallbackConnError(c *C) {
 
 func (s *CallbackConnSuite) TestCallbackConnConnectAlreadyConnected(c *C) {
 	client, _ := NewFakeConn()
-	conn := NewCallbackConn(client)
+	cbioClient := cbio.WrapReadWriteCloser(client)
+	conn := NewCallbackConn(cbioClient)
 
 	// Set state to connected
 	conn.setState(Connected)
@@ -272,7 +281,8 @@ func (s *CallbackConnSuite) TestCallbackConnConnectAlreadyConnected(c *C) {
 
 func (s *CallbackConnSuite) TestCallbackConnDisconnectAlreadyDisconnected(c *C) {
 	client, _ := NewFakeConn()
-	conn := NewCallbackConn(client)
+	cbioClient := cbio.WrapReadWriteCloser(client)
+	conn := NewCallbackConn(cbioClient)
 
 	// Connection is already disconnected by default
 	err := conn.Disconnect(nil)

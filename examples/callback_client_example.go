@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/go-stomp/stomp/v3"
+	"github.com/zodimo/go-netkit/cbio"
 )
 
 func main() {
@@ -16,8 +17,9 @@ func main() {
 		log.Fatal("Failed to connect to STOMP server:", err)
 	}
 
-	// Create callback-style STOMP connection
-	callbackConn := stomp.NewCallbackConn(conn)
+	// Create callback-style STOMP connection using cbio wrapper
+	cbioConn := cbio.WrapReadWriteCloser(conn)
+	callbackConn := stomp.NewCallbackConn(cbioConn)
 
 	// Set up callbacks for comprehensive monitoring
 	setupCallbacks(callbackConn)

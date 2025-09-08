@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/go-stomp/stomp/v3/frame"
+	"github.com/zodimo/go-netkit/cbio"
 )
 
 // newTestConnections creates a pair of connected pipes for testing
@@ -27,7 +28,7 @@ func TestCallbackConn_FullIntegration(t *testing.T) {
 	defer clientConn.Close()
 
 	// Create callback connection
-	callbackConn := NewCallbackConn(clientConn)
+	callbackConn := NewCallbackConn(cbio.WrapReadWriteCloser(clientConn))
 
 	// Test connection lifecycle
 	t.Run("ConnectionLifecycle", func(t *testing.T) {
@@ -489,7 +490,7 @@ func TestCallbackConn_ErrorRecovery(t *testing.T) {
 	defer serverConn.Close()
 	defer clientConn.Close()
 
-	callbackConn := NewCallbackConn(clientConn)
+	callbackConn := NewCallbackConn(cbio.WrapReadWriteCloser(clientConn))
 
 	// Set up error recovery callback
 	callbackConn.SetErrorRecoveryCallback(func(conn *CallbackConn, err error, recoveryAction RecoveryAction) RecoveryDecision {
@@ -519,7 +520,7 @@ func TestCallbackConn_HeartBeatNegotiation(t *testing.T) {
 	defer serverConn.Close()
 	defer clientConn.Close()
 
-	callbackConn := NewCallbackConn(clientConn)
+	callbackConn := NewCallbackConn(cbio.WrapReadWriteCloser(clientConn))
 
 	var heartBeatNegotiated bool
 	var wg sync.WaitGroup

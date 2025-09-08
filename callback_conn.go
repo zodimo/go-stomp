@@ -3,7 +3,6 @@ package stomp
 import (
 	"context"
 	"fmt"
-	"io"
 	"strings"
 	"sync"
 	"time"
@@ -16,8 +15,6 @@ import (
 type CallbackConn struct {
 	// cbio interface for asynchronous I/O
 	conn cbio.ReadWriteCloser
-	// standard io adapter for frame operations
-	ioAdapter io.ReadWriteCloser
 
 	// Connection state management
 	mu    sync.RWMutex
@@ -70,13 +67,11 @@ type CallbackConn struct {
 type CallbackConnOption func(*CallbackConn) error
 
 // NewCallbackConn creates a new callback-style STOMP connection
-func NewCallbackConn(conn io.ReadWriteCloser, opts ...CallbackConnOption) *CallbackConn {
-	cbioConn := cbio.WrapReadWriteCloser(conn)
+func NewCallbackConn(conn cbio.ReadWriteCloser, opts ...CallbackConnOption) *CallbackConn {
 
 	c := &CallbackConn{
-		conn:      cbioConn,
-		ioAdapter: conn,
-		state:     Disconnected,
+		conn:  conn,
+		state: Disconnected,
 		// Set default timeouts matching existing Conn
 		msgSendTimeout:            DefaultMsgSendTimeout,
 		rcvReceiptTimeout:         DefaultRcvReceiptTimeout,
@@ -349,11 +344,11 @@ func (c *CallbackConn) createConnectFrame() (*frame.Frame, error) {
 // performConnect handles the actual connection process
 func (c *CallbackConn) performConnect(connectFrame *frame.Frame) {
 	// Create frame writer and reader using the standard io adapter
-	writer := frame.NewWriter(c.ioAdapter)
-	reader := frame.NewReader(c.ioAdapter)
+	writer := frame.NewUnwrapCbioWriter(c.conn)
+	reader := frame.NewUnwrapCbioReader(c.conn)
 
 	// Send CONNECT frame
-	err := writer.Write(connectFrame)
+	err := writer.WriteSync(connectFrame)
 	if err != nil {
 		c.setState(Disconnected)
 		c.notifyError(err)
@@ -369,7 +364,7 @@ func (c *CallbackConn) performConnect(connectFrame *frame.Frame) {
 
 	// Read response asynchronously
 	go func() {
-		response, err := reader.Read()
+		response, err := reader.ReadSync()
 		if err != nil {
 			errorCh <- err
 			return
@@ -496,15 +491,15 @@ func (c *CallbackConn) Disconnect(disconnectCallback DisconnectCallback) error {
 // performDisconnect handles the actual disconnection process
 func (c *CallbackConn) performDisconnect() {
 	// Create frame writer and reader using the standard io adapter
-	writer := frame.NewWriter(c.ioAdapter)
-	reader := frame.NewReader(c.ioAdapter)
+	writer := frame.NewUnwrapCbioWriter(c.conn)
+	reader := frame.NewUnwrapCbioReader(c.conn)
 
 	// Create DISCONNECT frame with receipt
 	receiptId := allocateId()
 	disconnectFrame := frame.New(frame.DISCONNECT, frame.Receipt, receiptId)
 
 	// Send DISCONNECT frame
-	err := writer.Write(disconnectFrame)
+	err := writer.WriteSync(disconnectFrame)
 	if err != nil {
 		c.finalizeDisconnect(err)
 		return
@@ -520,7 +515,7 @@ func (c *CallbackConn) performDisconnect() {
 	// Read response asynchronously
 	go func() {
 		for {
-			response, err := reader.Read()
+			response, err := reader.ReadSync()
 			if err != nil {
 				errorCh <- err
 				return
@@ -556,7 +551,7 @@ func (c *CallbackConn) performDisconnect() {
 // finalizeDisconnect completes the disconnection process
 func (c *CallbackConn) finalizeDisconnect(err error) {
 	// Close the underlying connection
-	if closeErr := c.ioAdapter.Close(); closeErr != nil && err == nil {
+	if closeErr := c.conn.Close(); closeErr != nil && err == nil {
 		err = closeErr
 	}
 
@@ -575,8 +570,8 @@ func (c *CallbackConn) finalizeDisconnect(err error) {
 
 // startMessageProcessing starts the message processing loop with heart-beat monitoring
 func (c *CallbackConn) startMessageProcessing() {
-	reader := frame.NewReader(c.ioAdapter)
-	writer := frame.NewWriter(c.ioAdapter)
+	reader := frame.NewUnwrapCbioReader(c.conn)
+	writer := frame.NewUnwrapCbioWriter(c.conn)
 
 	var readTimeoutChannel <-chan time.Time
 	var writeTimeoutChannel <-chan time.Time
@@ -600,7 +595,7 @@ func (c *CallbackConn) startMessageProcessing() {
 	// Start frame reading goroutine
 	go func() {
 		for c.GetState() == Connected {
-			f, err := reader.Read()
+			f, err := reader.ReadSync()
 			if err != nil {
 				errorCh <- err
 				return
@@ -622,7 +617,7 @@ func (c *CallbackConn) startMessageProcessing() {
 
 		case <-writeTimeoutChannel:
 			// Write timeout - send heart-beat frame
-			err := writer.Write(nil)
+			err := writer.WriteSync(nil)
 			if err != nil {
 				c.notifyError(err)
 				c.setState(Disconnected)
@@ -753,8 +748,8 @@ func (c *CallbackConn) Begin(callback TransactionCallback) (*CallbackTransaction
 
 	// Create and send BEGIN frame
 	beginFrame := frame.New(frame.BEGIN, frame.Transaction, id)
-	writer := frame.NewWriter(c.ioAdapter)
-	err := writer.Write(beginFrame)
+	writer := frame.NewUnwrapCbioWriter(c.conn)
+	err := writer.WriteSync(beginFrame)
 	if err != nil {
 		// Remove transaction from map on error
 		c.mu.Lock()

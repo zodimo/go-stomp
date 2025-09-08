@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/go-stomp/stomp/v3/frame"
+	"github.com/zodimo/go-netkit/cbio"
 	. "gopkg.in/check.v1"
 )
 
@@ -14,10 +15,11 @@ var _ = Suite(&CallbackMessagingSuite{})
 
 func (s *CallbackMessagingSuite) TestSendWithCallback(c *C) {
 	client, server := NewFakeConn()
-	defer client.Close()
+	cbioClient := cbio.WrapReadWriteCloser(client)
+	defer cbioClient.Close()
 	defer server.Close()
 
-	conn := NewCallbackConn(client)
+	conn := NewCallbackConn(cbioClient)
 
 	// Set up connection state
 	conn.setState(Connected)
@@ -58,10 +60,11 @@ func (s *CallbackMessagingSuite) TestSendWithCallback(c *C) {
 
 func (s *CallbackMessagingSuite) TestSendWithReceiptCallback(c *C) {
 	client, server := NewFakeConn()
-	defer client.Close()
+	cbioClient := cbio.WrapReadWriteCloser(client)
+	defer cbioClient.Close()
 	defer server.Close()
 
-	conn := NewCallbackConn(client)
+	conn := NewCallbackConn(cbioClient)
 
 	// Set up connection state
 	conn.setState(Connected)
@@ -109,10 +112,11 @@ func (s *CallbackMessagingSuite) TestSendWithReceiptCallback(c *C) {
 
 func (s *CallbackMessagingSuite) TestSendReceiptTimeout(c *C) {
 	client, server := NewFakeConn()
-	defer client.Close()
+	cbioClient := cbio.WrapReadWriteCloser(client)
+	defer cbioClient.Close()
 	defer server.Close()
 
-	conn := NewCallbackConn(client)
+	conn := NewCallbackConn(cbioClient)
 
 	// Set up connection state
 	conn.setState(Connected)
@@ -143,10 +147,11 @@ func (s *CallbackMessagingSuite) TestSendReceiptTimeout(c *C) {
 
 func (s *CallbackMessagingSuite) TestSubscribeWithCallback(c *C) {
 	client, server := NewFakeConn()
-	defer client.Close()
+	cbioClient := cbio.WrapReadWriteCloser(client)
+	defer cbioClient.Close()
 	defer server.Close()
 
-	conn := NewCallbackConn(client)
+	conn := NewCallbackConn(cbioClient)
 
 	// Set up connection state
 	conn.setState(Connected)
@@ -194,10 +199,11 @@ func (s *CallbackMessagingSuite) TestSubscribeWithCallback(c *C) {
 
 func (s *CallbackMessagingSuite) TestUnsubscribeWithCallback(c *C) {
 	client, server := NewFakeConn()
-	defer client.Close()
+	cbioClient := cbio.WrapReadWriteCloser(client)
+	defer cbioClient.Close()
 	defer server.Close()
 
-	conn := NewCallbackConn(client)
+	conn := NewCallbackConn(cbioClient)
 
 	// Set up connection state
 	conn.setState(Connected)
@@ -258,10 +264,11 @@ func (s *CallbackMessagingSuite) TestUnsubscribeWithCallback(c *C) {
 
 func (s *CallbackMessagingSuite) TestMessageHandlerInvocation(c *C) {
 	client, server := NewFakeConn()
-	defer client.Close()
+	cbioClient := cbio.WrapReadWriteCloser(client)
+	defer cbioClient.Close()
 	defer server.Close()
 
-	conn := NewCallbackConn(client)
+	conn := NewCallbackConn(cbioClient)
 
 	// Set up connection state
 	conn.setState(Connected)
@@ -317,10 +324,11 @@ func (s *CallbackMessagingSuite) TestMessageHandlerInvocation(c *C) {
 
 func (s *CallbackMessagingSuite) TestAckWithCallback(c *C) {
 	client, server := NewFakeConn()
-	defer client.Close()
+	cbioClient := cbio.WrapReadWriteCloser(client)
+	defer cbioClient.Close()
 	defer server.Close()
 
-	conn := NewCallbackConn(client)
+	conn := NewCallbackConn(cbioClient)
 
 	// Set up connection state
 	conn.setState(Connected)
@@ -372,10 +380,11 @@ func (s *CallbackMessagingSuite) TestAckWithCallback(c *C) {
 
 func (s *CallbackMessagingSuite) TestNackWithCallback(c *C) {
 	client, server := NewFakeConn()
-	defer client.Close()
+	cbioClient := cbio.WrapReadWriteCloser(client)
+	defer cbioClient.Close()
 	defer server.Close()
 
-	conn := NewCallbackConn(client)
+	conn := NewCallbackConn(cbioClient)
 
 	// Set up connection state
 	conn.setState(Connected)
@@ -424,10 +433,11 @@ func (s *CallbackMessagingSuite) TestNackWithCallback(c *C) {
 
 func (s *CallbackMessagingSuite) TestNackNotSupportedInV10(c *C) {
 	client, server := NewFakeConn()
-	defer client.Close()
+	cbioClient := cbio.WrapReadWriteCloser(client)
+	defer cbioClient.Close()
 	defer server.Close()
 
-	conn := NewCallbackConn(client)
+	conn := NewCallbackConn(cbioClient)
 
 	// Set up connection state
 	conn.setState(Connected)
@@ -469,10 +479,11 @@ func (s *CallbackMessagingSuite) TestNackNotSupportedInV10(c *C) {
 
 func (s *CallbackMessagingSuite) TestAckAutoMode(c *C) {
 	client, server := NewFakeConn()
-	defer client.Close()
+	cbioClient := cbio.WrapReadWriteCloser(client)
+	defer cbioClient.Close()
 	defer server.Close()
 
-	conn := NewCallbackConn(client)
+	conn := NewCallbackConn(cbioClient)
 
 	// Set up connection state
 	conn.setState(Connected)
@@ -534,10 +545,11 @@ func (s *CallbackMessagingSuite) TestAckAutoMode(c *C) {
 
 func (s *CallbackMessagingSuite) TestSendNotConnected(c *C) {
 	client, server := NewFakeConn()
-	defer client.Close()
+	cbioClient := cbio.WrapReadWriteCloser(client)
+	defer cbioClient.Close()
 	defer server.Close()
 
-	conn := NewCallbackConn(client)
+	conn := NewCallbackConn(cbioClient)
 
 	// Connection not established
 	conn.setState(Disconnected)

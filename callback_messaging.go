@@ -78,10 +78,10 @@ func (c *CallbackConn) SendWithReceipt(destination, contentType string, body []b
 // performSend handles the actual sending of a message without receipt
 func (c *CallbackConn) performSend(f *frame.Frame, destination string) {
 	// Create frame writer using the standard io adapter
-	writer := frame.NewWriter(c.ioAdapter)
+	writer := frame.NewUnwrapCbioWriter(c.conn)
 
 	// Send SEND frame
-	err := writer.Write(f)
+	err := writer.WriteSync(f)
 
 	// Get callback and call it
 	c.mu.RLock()
@@ -96,11 +96,11 @@ func (c *CallbackConn) performSend(f *frame.Frame, destination string) {
 // performSendWithReceipt handles sending with receipt confirmation
 func (c *CallbackConn) performSendWithReceipt(f *frame.Frame, destination, receiptId string, timeout time.Duration) {
 	// Create frame writer and reader using the standard io adapter
-	writer := frame.NewWriter(c.ioAdapter)
-	reader := frame.NewReader(c.ioAdapter)
+	writer := frame.NewUnwrapCbioWriter(c.conn)
+	reader := frame.NewUnwrapCbioReader(c.conn)
 
 	// Send SEND frame
-	err := writer.Write(f)
+	err := writer.WriteSync(f)
 	if err != nil {
 		c.notifySendCallback(destination, err)
 		return
@@ -116,7 +116,7 @@ func (c *CallbackConn) performSendWithReceipt(f *frame.Frame, destination, recei
 	// Read response asynchronously
 	go func() {
 		for {
-			response, err := reader.Read()
+			response, err := reader.ReadSync()
 			if err != nil {
 				errorCh <- err
 				return
@@ -222,10 +222,10 @@ func (c *CallbackConn) Subscribe(destination string, ackMode AckMode, handler Me
 // performSubscribe handles the actual subscription process
 func (c *CallbackConn) performSubscribe(subscribeFrame *frame.Frame, subscription *CallbackSubscription) {
 	// Create frame writer using the standard io adapter
-	writer := frame.NewWriter(c.ioAdapter)
+	writer := frame.NewUnwrapCbioWriter(c.conn)
 
 	// Send SUBSCRIBE frame
-	err := writer.Write(subscribeFrame)
+	err := writer.WriteSync(subscribeFrame)
 
 	// Get callback
 	c.mu.RLock()
@@ -290,11 +290,11 @@ func (c *CallbackConn) Unsubscribe(subscription *CallbackSubscription, callback 
 // performUnsubscribe handles the actual unsubscription process
 func (c *CallbackConn) performUnsubscribe(unsubscribeFrame *frame.Frame, subscription *CallbackSubscription, receiptId string) {
 	// Create frame writer and reader using the standard io adapter
-	writer := frame.NewWriter(c.ioAdapter)
-	reader := frame.NewReader(c.ioAdapter)
+	writer := frame.NewUnwrapCbioWriter(c.conn)
+	reader := frame.NewUnwrapCbioReader(c.conn)
 
 	// Send UNSUBSCRIBE frame
-	err := writer.Write(unsubscribeFrame)
+	err := writer.WriteSync(unsubscribeFrame)
 	if err != nil {
 		c.notifySubscriptionCallback(subscription, SubscriptionError, err)
 		return
@@ -310,7 +310,7 @@ func (c *CallbackConn) performUnsubscribe(unsubscribeFrame *frame.Frame, subscri
 	// Read response asynchronously
 	go func() {
 		for {
-			response, err := reader.Read()
+			response, err := reader.ReadSync()
 			if err != nil {
 				errorCh <- err
 				return
@@ -440,10 +440,10 @@ func (c *CallbackConn) Nack(message *CallbackMessage, callback AckCallback) erro
 // performAck handles the actual acknowledgment process
 func (c *CallbackConn) performAck(f *frame.Frame, messageId string) {
 	// Create frame writer using the standard io adapter
-	writer := frame.NewWriter(c.ioAdapter)
+	writer := frame.NewUnwrapCbioWriter(c.conn)
 
 	// Send ACK/NACK frame
-	err := writer.Write(f)
+	err := writer.WriteSync(f)
 
 	// Get callback and call it
 	c.mu.RLock()
@@ -548,8 +548,8 @@ func (c *CallbackConn) AckTx(tx *CallbackTransaction, message *CallbackMessage, 
 		f.Header.Set(frame.Transaction, tx.id)
 
 		// Send the frame
-		writer := frame.NewWriter(c.ioAdapter)
-		err = writer.Write(f)
+		writer := frame.NewUnwrapCbioWriter(c.conn)
+		err = writer.WriteSync(f)
 		if err != nil {
 			if callback != nil {
 				go callback(c, message.ackId, err)
@@ -610,8 +610,8 @@ func (c *CallbackConn) NackTx(tx *CallbackTransaction, message *CallbackMessage,
 		f.Header.Set(frame.Transaction, tx.id)
 
 		// Send the frame
-		writer := frame.NewWriter(c.ioAdapter)
-		err = writer.Write(f)
+		writer := frame.NewUnwrapCbioWriter(c.conn)
+		err = writer.WriteSync(f)
 		if err != nil {
 			if callback != nil {
 				go callback(c, message.ackId, err)
