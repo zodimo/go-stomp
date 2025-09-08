@@ -648,6 +648,12 @@ func (c *Conn) handleUnsubscribe(f *frame.Frame) error {
 		return subscriptionNotFound
 	}
 
+	// Send a receipt and remove the header
+	err := c.sendReceiptImmediately(f)
+	if err != nil {
+		return err
+	}
+
 	// remove the subscription
 	delete(c.subs, id)
 
