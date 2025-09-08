@@ -1,6 +1,7 @@
 package stomp
 
 import (
+	"fmt"
 	"net"
 	"sync"
 	"testing"
@@ -123,13 +124,14 @@ func testConnectionLifecycle(t *testing.T, callbackConn *CallbackConn, serverCon
 	}
 
 	// Wait for disconnection
+	disconnectDone := make(chan struct{})
 	go func() {
 		wg.Wait()
-		close(done)
+		close(disconnectDone)
 	}()
 
 	select {
-	case <-done:
+	case <-disconnectDone:
 		if !disconnectSuccess {
 			t.Fatal("Disconnection was not successful")
 		}
@@ -250,13 +252,14 @@ func testTransactions(t *testing.T, conn *CallbackConn) {
 	}
 
 	// Wait for send completion
+	sendDone := make(chan struct{})
 	go func() {
 		wg.Wait()
-		close(done)
+		close(sendDone)
 	}()
 
 	select {
-	case <-done:
+	case <-sendDone:
 		if !txSendSuccess {
 			t.Error("Transactional send was not successful")
 		}
@@ -282,13 +285,14 @@ func testTransactions(t *testing.T, conn *CallbackConn) {
 	}
 
 	// Wait for commit completion
+	commitDone := make(chan struct{})
 	go func() {
 		wg.Wait()
-		close(done)
+		close(commitDone)
 	}()
 
 	select {
-	case <-done:
+	case <-commitDone:
 		if !txCommitSuccess {
 			t.Error("Transaction commit was not successful")
 		}
@@ -321,11 +325,13 @@ func testSubscriptions(t *testing.T, conn *CallbackConn) {
 				t.Logf("Subscription event: %s (ID: %s)", event, subscription.Id())
 				if event == SubscriptionCreated {
 					subscribeSuccess = true
+					wg.Done() // Only call Done() for SubscriptionCreated
 				} else if event == SubscriptionUnsubscribed {
 					unsubscribeSuccess = true
+					wg.Done() // Only call Done() for SubscriptionUnsubscribed
 				}
+				// Note: SubscriptionActive events are logged but don't trigger wg.Done()
 			}
-			wg.Done()
 		})
 
 	if err != nil {
@@ -380,13 +386,14 @@ func testSubscriptions(t *testing.T, conn *CallbackConn) {
 	}
 
 	// Wait for unsubscribe completion
+	unsubDone := make(chan struct{})
 	go func() {
 		wg.Wait()
-		close(done)
+		close(unsubDone)
 	}()
 
 	select {
-	case <-done:
+	case <-unsubDone:
 		if !unsubscribeSuccess {
 			t.Error("Unsubscription was not successful")
 		}
@@ -432,7 +439,13 @@ func handleServerResponses(serverConn net.Conn) {
 	for {
 		f, err := reader.Read()
 		if err != nil {
+			fmt.Printf("Server handler: Connection closed or error: %v\n", err)
 			return // Connection closed
+		}
+
+		fmt.Printf("Server handler: Received frame: %s\n", f.Command)
+		if receiptId := f.Header.Get(frame.Receipt); receiptId != "" {
+			fmt.Printf("Server handler: Frame has receipt ID: %s\n", receiptId)
 		}
 
 		switch f.Command {
@@ -442,12 +455,14 @@ func handleServerResponses(serverConn net.Conn) {
 				frame.Version, "1.2",
 				frame.Server, "test-server",
 				frame.Session, "test-session")
+			fmt.Printf("Server handler: Sending CONNECTED frame\n")
 			writer.Write(connectedFrame)
 
 		case frame.DISCONNECT:
 			// Respond with RECEIPT if requested
 			if receiptId := f.Header.Get(frame.Receipt); receiptId != "" {
 				receiptFrame := frame.New(frame.RECEIPT, frame.ReceiptId, receiptId)
+				fmt.Printf("Server handler: Sending RECEIPT for DISCONNECT (ID: %s)\n", receiptId)
 				writer.Write(receiptFrame)
 			}
 			return
@@ -456,21 +471,25 @@ func handleServerResponses(serverConn net.Conn) {
 			// Respond with RECEIPT if requested
 			if receiptId := f.Header.Get(frame.Receipt); receiptId != "" {
 				receiptFrame := frame.New(frame.RECEIPT, frame.ReceiptId, receiptId)
+				fmt.Printf("Server handler: Sending RECEIPT for SEND (ID: %s)\n", receiptId)
 				writer.Write(receiptFrame)
 			}
 
 		case frame.BEGIN:
 			// Transaction begun, no response needed
+			fmt.Printf("Server handler: BEGIN transaction, no response needed\n")
 			continue
 
 		case frame.COMMIT, frame.ABORT:
 			// Transaction completed, no response needed
+			fmt.Printf("Server handler: COMMIT/ABORT transaction, no response needed\n")
 			continue
 
 		case frame.SUBSCRIBE:
 			// Respond with RECEIPT if requested
 			if receiptId := f.Header.Get(frame.Receipt); receiptId != "" {
 				receiptFrame := frame.New(frame.RECEIPT, frame.ReceiptId, receiptId)
+				fmt.Printf("Server handler: Sending RECEIPT for SUBSCRIBE (ID: %s)\n", receiptId)
 				writer.Write(receiptFrame)
 			}
 
@@ -478,8 +497,12 @@ func handleServerResponses(serverConn net.Conn) {
 			// Respond with RECEIPT if requested
 			if receiptId := f.Header.Get(frame.Receipt); receiptId != "" {
 				receiptFrame := frame.New(frame.RECEIPT, frame.ReceiptId, receiptId)
+				fmt.Printf("Server handler: Sending RECEIPT for UNSUBSCRIBE (ID: %s)\n", receiptId)
 				writer.Write(receiptFrame)
 			}
+
+		default:
+			fmt.Printf("Server handler: Unknown frame command: %s\n", f.Command)
 		}
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/go-stomp/stomp/v3/frame"
+	"github.com/go-stomp/stomp/v3/internal/log"
 	"github.com/zodimo/go-netkit/cbio"
 )
 
@@ -61,6 +62,16 @@ type CallbackConn struct {
 
 	// Connection options
 	options connOptions
+
+	// Logging
+	log Logger
+
+	// Background frame reader
+	readerRunning   bool
+	readerStartedAt time.Time
+	readerDone      chan struct{}
+	frameChannel    chan *frame.Frame
+	errorChannel    chan error
 }
 
 // CallbackConnOption represents options for callback connections
@@ -85,6 +96,9 @@ func NewCallbackConn(conn cbio.ReadWriteCloser, opts ...CallbackConnOption) *Cal
 		transactions: make(map[string]*CallbackTransaction),
 		// Initialize health status
 		healthStatus: HealthUnknown,
+		// Initialize frame reader channels
+		frameChannel: make(chan *frame.Frame, 100), // Buffered channel for frames
+		errorChannel: make(chan error, 10),         // Buffered channel for errors
 	}
 
 	// Initialize default options
@@ -106,6 +120,13 @@ func NewCallbackConn(conn cbio.ReadWriteCloser, opts ...CallbackConnOption) *Cal
 	// Apply options to connection
 	c.readTimeout = c.options.ReadTimeout
 	c.writeTimeout = c.options.WriteTimeout
+
+	// Set logger from options (defaults to StdLogger)
+	if c.options.Logger != nil {
+		c.log = c.options.Logger
+	} else {
+		c.log = log.StdLogger{}
+	}
 
 	return c
 }
@@ -198,7 +219,15 @@ func (c *CallbackConn) GetHealthStatus() ConnectionHealth {
 func (c *CallbackConn) GetConnectionStats() CallbackConnectionStats {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.stats
+
+	stats := c.stats
+	// Add frame reader metrics
+	stats.FrameReaderRunning = c.readerRunning
+	stats.FrameReaderStartedAt = c.readerStartedAt
+	stats.FrameChannelSize = len(c.frameChannel)
+	stats.ErrorChannelSize = len(c.errorChannel)
+
+	return stats
 }
 
 // setState changes the connection state and notifies callbacks
@@ -263,6 +292,18 @@ func (c *CallbackConn) notifyError(err error) {
 	}
 }
 
+// handleConnectionError handles connection errors with proper cleanup
+func (c *CallbackConn) handleConnectionError(err error) {
+	// Stop frame reader if running
+	c.stopFrameReader()
+
+	// Set state to disconnected
+	c.setState(Disconnected)
+
+	// Notify error callback
+	c.notifyError(err)
+}
+
 // notifyHeartBeat calls the heart-beat callback if set
 func (c *CallbackConn) notifyHeartBeat(event HeartBeatEvent, err error) {
 	c.mu.RLock()
@@ -283,6 +324,148 @@ func (c *CallbackConn) notifyHeartBeat(event HeartBeatEvent, err error) {
 
 	if heartBeatCallback != nil {
 		heartBeatCallback(c, event, err)
+	}
+}
+
+// startFrameReader starts the background frame reader goroutine
+func (c *CallbackConn) startFrameReader() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Don't start if already running
+	if c.readerRunning {
+		if c.log != nil {
+			c.log.Debug("frame reader already running, skipping start")
+		}
+		return
+	}
+
+	c.readerRunning = true
+	c.readerStartedAt = time.Now()
+	c.readerDone = make(chan struct{})
+
+	if c.log != nil {
+		c.log.Debug("starting background frame reader")
+	}
+
+	// Start the frame reader goroutine
+	go c.frameReaderLoop()
+}
+
+// stopFrameReader stops the background frame reader goroutine
+func (c *CallbackConn) stopFrameReader() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !c.readerRunning {
+		if c.log != nil {
+			c.log.Debug("frame reader not running, skipping stop")
+		}
+		return
+	}
+
+	if c.log != nil {
+		c.log.Debug("stopping background frame reader")
+	}
+
+	c.readerRunning = false
+
+	// Wait for reader to finish
+	if c.readerDone != nil {
+		<-c.readerDone
+		c.readerDone = nil
+		if c.log != nil {
+			c.log.Debug("background frame reader stopped")
+		}
+	}
+}
+
+// frameReaderLoop runs the background frame reading loop
+func (c *CallbackConn) frameReaderLoop() {
+	reader := frame.NewUnwrapCbioReader(c.conn)
+	defer close(c.readerDone)
+
+	if c.log != nil {
+		c.log.Debug("frame reader loop started")
+	}
+
+	// Create channels for async frame reading
+	frameCh := make(chan *frame.Frame, 1)
+	errorCh := make(chan error, 1)
+
+	// Start async frame reading goroutine
+	go func() {
+		for {
+			frame, err := reader.ReadSync()
+			if err != nil {
+				if c.log != nil {
+					c.log.Debugf("frame reader error: %v", err)
+				}
+				errorCh <- err
+				return
+			}
+			if c.log != nil {
+				if frame == nil {
+					c.log.Debug("received heart-beat frame")
+				} else {
+					c.log.Debugf("received frame: %s", frame.Command)
+				}
+			}
+			frameCh <- frame
+		}
+	}()
+
+	frameCount := 0
+	for {
+		state := c.GetState()
+		// Stop reading if disconnected or disconnecting
+		if state == Disconnected {
+			if c.log != nil {
+				c.log.Debugf("frame reader loop exiting, processed %d frames", frameCount)
+			}
+			return
+		}
+
+		select {
+		case frame := <-frameCh:
+			frameCount++
+			// Send frame to frame channel if connection is still active
+			currentState := c.GetState()
+			if currentState != Disconnected {
+				select {
+				case c.frameChannel <- frame:
+				default:
+					if c.log != nil {
+						c.log.Warning("frame channel is full, dropping frame")
+					}
+				}
+			}
+
+		case err := <-errorCh:
+			if c.log != nil {
+				c.log.Errorf("frame reading failed: %v", err)
+			}
+			// Send error to error channel if connection is still active
+			currentState := c.GetState()
+			if currentState != Disconnected {
+				select {
+				case c.errorChannel <- err:
+				default:
+					if c.log != nil {
+						c.log.Error("error channel is full, dropping error")
+					}
+				}
+			}
+			return
+
+		case <-time.After(30 * time.Second):
+			// Check if we should still be running every 30 seconds
+			// This prevents the goroutine from hanging indefinitely
+			if c.log != nil {
+				c.log.Debugf("frame reader health check - processed %d frames", frameCount)
+			}
+			continue
+		}
 	}
 }
 
@@ -343,44 +526,43 @@ func (c *CallbackConn) createConnectFrame() (*frame.Frame, error) {
 
 // performConnect handles the actual connection process
 func (c *CallbackConn) performConnect(connectFrame *frame.Frame) {
-	// Create frame writer and reader using the standard io adapter
+	// Create frame writer using the standard io adapter
 	writer := frame.NewUnwrapCbioWriter(c.conn)
-	reader := frame.NewUnwrapCbioReader(c.conn)
 
 	// Send CONNECT frame
 	err := writer.WriteSync(connectFrame)
 	if err != nil {
-		c.setState(Disconnected)
-		c.notifyError(err)
+		c.handleConnectionError(err)
 		return
 	}
+
+	// Start temporary frame reader for connection process
+	c.startFrameReader()
 
 	// Wait for CONNECTED response with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	responseCh := make(chan *frame.Frame, 1)
-	errorCh := make(chan error, 1)
+	for {
+		select {
+		case response := <-c.frameChannel:
+			if response != nil && response.Command == frame.CONNECTED {
+				c.handleConnectResponse(response)
+				return
+			} else if response != nil && response.Command == frame.ERROR {
+				c.handleConnectionError(newError(response))
+				return
+			}
+			// Continue waiting for CONNECTED frame, ignore other frames
 
-	// Read response asynchronously
-	go func() {
-		response, err := reader.ReadSync()
-		if err != nil {
-			errorCh <- err
+		case err := <-c.errorChannel:
+			c.handleConnectionError(err)
+			return
+
+		case <-ctx.Done():
+			c.handleConnectionError(ctx.Err())
 			return
 		}
-		responseCh <- response
-	}()
-
-	select {
-	case response := <-responseCh:
-		c.handleConnectResponse(response)
-	case err := <-errorCh:
-		c.setState(Disconnected)
-		c.notifyError(err)
-	case <-ctx.Done():
-		c.setState(Disconnected)
-		c.notifyError(ctx.Err())
 	}
 }
 
@@ -388,8 +570,7 @@ func (c *CallbackConn) performConnect(connectFrame *frame.Frame) {
 func (c *CallbackConn) handleConnectResponse(response *frame.Frame) {
 	if response.Command != frame.CONNECTED {
 		err := newError(response)
-		c.setState(Disconnected)
-		c.notifyError(err)
+		c.handleConnectionError(err)
 		return
 	}
 
@@ -401,8 +582,7 @@ func (c *CallbackConn) handleConnectResponse(response *frame.Frame) {
 	if versionString := response.Header.Get(frame.Version); versionString != "" {
 		version := Version(versionString)
 		if err := version.CheckSupported(); err != nil {
-			c.setState(Disconnected)
-			c.notifyError(Error{
+			c.handleConnectionError(Error{
 				Message: err.Error(),
 				Frame:   response,
 			})
@@ -418,8 +598,7 @@ func (c *CallbackConn) handleConnectResponse(response *frame.Frame) {
 	if heartBeat, ok := response.Header.Contains(frame.HeartBeat); ok {
 		readTimeout, writeTimeout, err := frame.ParseHeartBeat(heartBeat)
 		if err != nil {
-			c.setState(Disconnected)
-			c.notifyError(Error{
+			c.handleConnectionError(Error{
 				Message: err.Error(),
 				Frame:   response,
 			})
@@ -454,7 +633,7 @@ func (c *CallbackConn) handleConnectResponse(response *frame.Frame) {
 	c.stats.ConnectedAt = time.Now()
 	c.mu.Unlock()
 
-	// Start message processing loop
+	// Start message processing loop (frame reader already started in performConnect)
 	go c.startMessageProcessing()
 
 	// Call the connect callback
@@ -490,9 +669,8 @@ func (c *CallbackConn) Disconnect(disconnectCallback DisconnectCallback) error {
 
 // performDisconnect handles the actual disconnection process
 func (c *CallbackConn) performDisconnect() {
-	// Create frame writer and reader using the standard io adapter
+	// Create frame writer using the standard io adapter
 	writer := frame.NewUnwrapCbioWriter(c.conn)
-	reader := frame.NewUnwrapCbioReader(c.conn)
 
 	// Create DISCONNECT frame with receipt
 	receiptId := allocateId()
@@ -505,51 +683,44 @@ func (c *CallbackConn) performDisconnect() {
 		return
 	}
 
-	// Wait for RECEIPT response with timeout
+	// Wait for RECEIPT response with timeout using background frame reader
 	ctx, cancel := context.WithTimeout(context.Background(), c.disconnectReceiptTimeout)
 	defer cancel()
 
-	responseCh := make(chan *frame.Frame, 1)
-	errorCh := make(chan error, 1)
-
-	// Read response asynchronously
-	go func() {
-		for {
-			response, err := reader.ReadSync()
-			if err != nil {
-				errorCh <- err
-				return
-			}
-
-			// Check if this is the receipt we're waiting for
-			if response.Command == frame.RECEIPT {
+	for {
+		select {
+		case response := <-c.frameChannel:
+			if response != nil && response.Command == frame.RECEIPT {
 				if response.Header.Get(frame.ReceiptId) == receiptId {
-					responseCh <- response
+					// Receipt received, disconnect successful
+					c.finalizeDisconnect(nil)
 					return
 				}
 				// Continue reading if it's not our receipt
-			} else if response.Command == frame.ERROR {
-				errorCh <- newError(response)
+			} else if response != nil && response.Command == frame.ERROR {
+				c.finalizeDisconnect(newError(response))
 				return
 			}
-		}
-	}()
+			// Continue waiting for our receipt, ignore other frames
 
-	select {
-	case <-responseCh:
-		// Receipt received, disconnect successful
-		c.finalizeDisconnect(nil)
-	case err := <-errorCh:
-		// Error occurred
-		c.finalizeDisconnect(err)
-	case <-ctx.Done():
-		// Timeout occurred
-		c.finalizeDisconnect(ErrDisconnectReceiptTimeout)
+		case err := <-c.errorChannel:
+			// Error occurred
+			c.finalizeDisconnect(err)
+			return
+
+		case <-ctx.Done():
+			// Timeout occurred
+			c.finalizeDisconnect(ErrDisconnectReceiptTimeout)
+			return
+		}
 	}
 }
 
 // finalizeDisconnect completes the disconnection process
 func (c *CallbackConn) finalizeDisconnect(err error) {
+	// Stop the background frame reader
+	c.stopFrameReader()
+
 	// Close the underlying connection
 	if closeErr := c.conn.Close(); closeErr != nil && err == nil {
 		err = closeErr
@@ -570,7 +741,6 @@ func (c *CallbackConn) finalizeDisconnect(err error) {
 
 // startMessageProcessing starts the message processing loop with heart-beat monitoring
 func (c *CallbackConn) startMessageProcessing() {
-	reader := frame.NewUnwrapCbioReader(c.conn)
 	writer := frame.NewUnwrapCbioWriter(c.conn)
 
 	var readTimeoutChannel <-chan time.Time
@@ -588,22 +758,6 @@ func (c *CallbackConn) startMessageProcessing() {
 		writeTimeoutChannel = writeTimer.C
 	}
 
-	// Create channel for incoming frames
-	frameCh := make(chan *frame.Frame, 1)
-	errorCh := make(chan error, 1)
-
-	// Start frame reading goroutine
-	go func() {
-		for c.GetState() == Connected {
-			f, err := reader.ReadSync()
-			if err != nil {
-				errorCh <- err
-				return
-			}
-			frameCh <- f
-		}
-	}()
-
 	// Main processing loop with heart-beat monitoring
 	for c.GetState() == Connected {
 		select {
@@ -611,16 +765,14 @@ func (c *CallbackConn) startMessageProcessing() {
 			// Read timeout - heart-beat not received in time
 			c.notifyHeartBeat(HeartBeatTimeout, ErrClosedUnexpectedly)
 			c.setHealthStatus(HealthUnhealthy)
-			c.notifyError(newErrorMessage("read timeout"))
-			c.setState(Disconnected)
+			c.handleConnectionError(newErrorMessage("read timeout"))
 			return
 
 		case <-writeTimeoutChannel:
 			// Write timeout - send heart-beat frame
 			err := writer.WriteSync(nil)
 			if err != nil {
-				c.notifyError(err)
-				c.setState(Disconnected)
+				c.handleConnectionError(err)
 				return
 			}
 			c.notifyHeartBeat(HeartBeatSent, nil)
@@ -635,13 +787,12 @@ func (c *CallbackConn) startMessageProcessing() {
 				writeTimer.Reset(c.writeTimeout)
 			}
 
-		case err := <-errorCh:
-			// Error reading frame
-			c.notifyError(err)
-			c.setState(Disconnected)
+		case err := <-c.errorChannel:
+			// Error from background frame reader
+			c.handleConnectionError(err)
 			return
 
-		case f := <-frameCh:
+		case f := <-c.frameChannel:
 			// Reset read timer when we receive any frame
 			if readTimer != nil {
 				readTimer.Reset(time.Duration(float64(c.readTimeout) * c.hbGracePeriodMultiplier))
@@ -666,8 +817,7 @@ func (c *CallbackConn) startMessageProcessing() {
 				// Receipt frames are handled by individual operations
 				continue
 			case frame.ERROR:
-				c.notifyError(newError(f))
-				c.setState(Disconnected)
+				c.handleConnectionError(newError(f))
 				return
 			}
 		}

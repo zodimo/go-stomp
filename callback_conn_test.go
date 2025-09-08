@@ -92,6 +92,176 @@ func (s *CallbackConnSuite) TestNewCallbackConn(c *C) {
 	c.Assert(conn.msgSendTimeout, Equals, DefaultMsgSendTimeout)
 	c.Assert(conn.rcvReceiptTimeout, Equals, DefaultRcvReceiptTimeout)
 	c.Assert(conn.disconnectReceiptTimeout, Equals, DefaultDisconnectReceiptTimeout)
+
+	// Verify frame reader is initialized but not running
+	stats := conn.GetConnectionStats()
+	c.Assert(stats.FrameReaderRunning, Equals, false)
+	c.Assert(conn.frameChannel, NotNil)
+	c.Assert(conn.errorChannel, NotNil)
+}
+
+func (s *CallbackConnSuite) TestFrameReaderStartStop(c *C) {
+	client, _ := NewFakeConn()
+	cbioClient := cbio.WrapReadWriteCloser(client)
+	conn := NewCallbackConn(cbioClient)
+
+	// Initially frame reader should not be running
+	stats := conn.GetConnectionStats()
+	c.Assert(stats.FrameReaderRunning, Equals, false)
+
+	// Start frame reader
+	conn.startFrameReader()
+
+	// Verify frame reader is running
+	stats = conn.GetConnectionStats()
+	c.Assert(stats.FrameReaderRunning, Equals, true)
+	c.Assert(stats.FrameReaderStartedAt.IsZero(), Equals, false)
+
+	// Stop frame reader
+	conn.stopFrameReader()
+
+	// Verify frame reader is stopped
+	stats = conn.GetConnectionStats()
+	c.Assert(stats.FrameReaderRunning, Equals, false)
+}
+
+func (s *CallbackConnSuite) TestFrameReaderDoubleStart(c *C) {
+	client, _ := NewFakeConn()
+	cbioClient := cbio.WrapReadWriteCloser(client)
+	conn := NewCallbackConn(cbioClient)
+
+	// Start frame reader twice
+	conn.startFrameReader()
+	conn.startFrameReader() // Should be no-op
+
+	// Verify only one reader is running
+	stats := conn.GetConnectionStats()
+	c.Assert(stats.FrameReaderRunning, Equals, true)
+
+	// Stop should work normally
+	conn.stopFrameReader()
+	stats = conn.GetConnectionStats()
+	c.Assert(stats.FrameReaderRunning, Equals, false)
+}
+
+func (s *CallbackConnSuite) TestFrameReaderDoubleStop(c *C) {
+	client, _ := NewFakeConn()
+	cbioClient := cbio.WrapReadWriteCloser(client)
+	conn := NewCallbackConn(cbioClient)
+
+	// Stop without starting (should be no-op)
+	conn.stopFrameReader()
+
+	// Start and then stop twice
+	conn.startFrameReader()
+	conn.stopFrameReader()
+	conn.stopFrameReader() // Should be no-op
+
+	stats := conn.GetConnectionStats()
+	c.Assert(stats.FrameReaderRunning, Equals, false)
+}
+
+func (s *CallbackConnSuite) TestFrameReaderIntegrationWithConnection(c *C) {
+	client, server := NewFakeConn()
+	cbioClient := cbio.WrapReadWriteCloser(client)
+	conn := NewCallbackConn(cbioClient)
+
+	// Set up callbacks to track events
+	var connectedCalled bool
+
+	conn.SetErrorCallback(func(c *CallbackConn, err error) {
+		// Error callback for connection issues
+	})
+
+	// Start connection process
+	err := conn.Connect(func(c *CallbackConn, session, server string, version Version) {
+		connectedCalled = true
+	})
+	c.Assert(err, IsNil)
+
+	// Verify frame reader is started during connection
+	time.Sleep(50 * time.Millisecond) // Give time for connection process to start
+	stats := conn.GetConnectionStats()
+	c.Assert(stats.FrameReaderRunning, Equals, true)
+
+	// Send CONNECTED response from server
+	connectedFrame := frame.New(frame.CONNECTED, frame.Version, string(V12), frame.Session, "test-session")
+	writer := frame.NewWriter(server)
+	err = writer.Write(connectedFrame)
+	c.Assert(err, IsNil)
+
+	// Wait for connection to complete
+	time.Sleep(100 * time.Millisecond)
+	c.Assert(conn.GetState(), Equals, Connected)
+	c.Assert(connectedCalled, Equals, true)
+
+	// Verify frame reader is still running after successful connection
+	stats = conn.GetConnectionStats()
+	c.Assert(stats.FrameReaderRunning, Equals, true)
+
+	// Close connection
+	server.Close()
+	client.Close()
+}
+
+func (s *CallbackConnSuite) TestFrameReaderErrorHandling(c *C) {
+	client, server := NewFakeConn()
+	cbioClient := cbio.WrapReadWriteCloser(client)
+	conn := NewCallbackConn(cbioClient)
+
+	var errorCalled bool
+	var lastError error
+
+	conn.SetErrorCallback(func(c *CallbackConn, err error) {
+		errorCalled = true
+		lastError = err
+	})
+
+	// Start connection process
+	err := conn.Connect(func(c *CallbackConn, session, server string, version Version) {
+		// Should not be called due to connection error
+	})
+	c.Assert(err, IsNil)
+
+	// Wait for frame reader to start
+	time.Sleep(50 * time.Millisecond)
+
+	// Close server side to cause read error
+	server.Close()
+
+	// Wait for error to propagate
+	time.Sleep(100 * time.Millisecond)
+
+	c.Assert(errorCalled, Equals, true)
+	c.Assert(lastError, NotNil)
+	c.Assert(conn.GetState(), Equals, Disconnected)
+
+	// Verify frame reader is stopped after error
+	stats := conn.GetConnectionStats()
+	c.Assert(stats.FrameReaderRunning, Equals, false)
+}
+
+func (s *CallbackConnSuite) TestFrameReaderChannelMetrics(c *C) {
+	client, _ := NewFakeConn()
+	cbioClient := cbio.WrapReadWriteCloser(client)
+	conn := NewCallbackConn(cbioClient)
+
+	// Check initial channel sizes
+	stats := conn.GetConnectionStats()
+	c.Assert(stats.FrameChannelSize, Equals, 0)
+	c.Assert(stats.ErrorChannelSize, Equals, 0)
+
+	// Start frame reader
+	conn.startFrameReader()
+
+	// Channel sizes should still be 0 initially
+	stats = conn.GetConnectionStats()
+	c.Assert(stats.FrameChannelSize, Equals, 0)
+	c.Assert(stats.ErrorChannelSize, Equals, 0)
+	c.Assert(stats.FrameReaderRunning, Equals, true)
+
+	// Stop frame reader
+	conn.stopFrameReader()
 }
 
 func (s *CallbackConnSuite) TestCallbackConnConnect(c *C) {

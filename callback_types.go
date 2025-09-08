@@ -359,6 +359,14 @@ type CallbackConnectionStats struct {
 	ConnectedAt time.Time
 	// LastError is the last error that occurred
 	LastError error
+	// FrameReaderRunning indicates if the background frame reader is active
+	FrameReaderRunning bool
+	// FrameReaderStartedAt is the timestamp when the frame reader was started
+	FrameReaderStartedAt time.Time
+	// FrameChannelSize is the current size of the frame channel
+	FrameChannelSize int
+	// ErrorChannelSize is the current size of the error channel
+	ErrorChannelSize int
 }
 
 // CallbackTransaction represents a transaction in the callback-style client
