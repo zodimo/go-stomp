@@ -43,6 +43,13 @@ type CallbackConn struct {
 	stateChangeCallback StateChangeCallback
 	errorCallback       ErrorCallback
 
+	// Message handling
+	subscriptions        map[string]*CallbackSubscription
+	messageHandlers      map[string]MessageHandler
+	sendCallback         SendCallback
+	subscriptionCallback SubscriptionCallback
+	ackCallback          AckCallback
+
 	// Connection options
 	options connOptions
 }
@@ -64,6 +71,9 @@ func NewCallbackConn(conn io.ReadWriteCloser, opts ...CallbackConnOption) *Callb
 		disconnectReceiptTimeout:  DefaultDisconnectReceiptTimeout,
 		unsubscribeReceiptTimeout: DefaultUnsubscribeReceiptTimeout,
 		hbGracePeriodMultiplier:   1.0,
+		// Initialize message handling maps
+		subscriptions:   make(map[string]*CallbackSubscription),
+		messageHandlers: make(map[string]MessageHandler),
 	}
 
 	// Initialize default options
@@ -108,6 +118,27 @@ func (c *CallbackConn) SetErrorCallback(callback ErrorCallback) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.errorCallback = callback
+}
+
+// SetSendCallback sets the callback for send operations
+func (c *CallbackConn) SetSendCallback(callback SendCallback) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sendCallback = callback
+}
+
+// SetSubscriptionCallback sets the callback for subscription events
+func (c *CallbackConn) SetSubscriptionCallback(callback SubscriptionCallback) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.subscriptionCallback = callback
+}
+
+// SetAckCallback sets the callback for acknowledgment operations
+func (c *CallbackConn) SetAckCallback(callback AckCallback) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ackCallback = callback
 }
 
 // setState changes the connection state and notifies callbacks
@@ -295,6 +326,9 @@ func (c *CallbackConn) handleConnectResponse(response *frame.Frame) {
 	// Connection successful
 	c.setState(Connected)
 
+	// Start message processing loop
+	go c.startMessageProcessing()
+
 	// Call the connect callback
 	c.mu.RLock()
 	callback := c.connectCallback
@@ -404,4 +438,76 @@ func (c *CallbackConn) finalizeDisconnect(err error) {
 	if callback != nil {
 		callback(c, err)
 	}
+}
+
+// startMessageProcessing starts the message processing loop
+func (c *CallbackConn) startMessageProcessing() {
+	reader := frame.NewReader(c.ioAdapter)
+
+	for c.GetState() == Connected {
+		f, err := reader.Read()
+		if err != nil {
+			c.notifyError(err)
+			break
+		}
+
+		if f == nil {
+			// heart-beat received
+			continue
+		}
+
+		switch f.Command {
+		case frame.MESSAGE:
+			c.handleMessageFrame(f)
+		case frame.RECEIPT:
+			// Receipt frames are handled by individual operations
+			continue
+		case frame.ERROR:
+			c.notifyError(newError(f))
+			c.setState(Disconnected)
+			return
+		}
+	}
+}
+
+// handleMessageFrame processes incoming MESSAGE frames
+func (c *CallbackConn) handleMessageFrame(f *frame.Frame) {
+	// Get subscription ID from frame
+	subscriptionId, ok := f.Header.Contains(frame.Subscription)
+	if !ok {
+		// No subscription ID, ignore the message
+		return
+	}
+
+	// Find the subscription and handler
+	c.mu.RLock()
+	subscription, exists := c.subscriptions[subscriptionId]
+	handler, hasHandler := c.messageHandlers[subscriptionId]
+	c.mu.RUnlock()
+
+	if !exists || !hasHandler || !subscription.active {
+		// No active subscription or handler, ignore the message
+		return
+	}
+
+	// Create callback message
+	message := &CallbackMessage{
+		Header:       f.Header,
+		Body:         f.Body,
+		Subscription: subscription,
+		Conn:         c,
+		Destination:  f.Header.Get(frame.Destination),
+		ContentType:  f.Header.Get(frame.ContentType),
+	}
+
+	// Set ack ID based on acknowledgment mode and protocol version
+	switch subscription.ackMode {
+	case AckClient, AckClientIndividual:
+		if messageId, ok := f.Header.Contains(frame.MessageId); ok {
+			message.ackId = messageId
+		}
+	}
+
+	// Call the message handler asynchronously to avoid blocking the processing loop
+	go handler(c, message)
 }
