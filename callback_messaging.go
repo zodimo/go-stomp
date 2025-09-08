@@ -95,47 +95,38 @@ func (c *CallbackConn) performSend(f *frame.Frame, destination string) {
 
 // performSendWithReceipt handles sending with receipt confirmation
 func (c *CallbackConn) performSendWithReceipt(f *frame.Frame, destination, receiptId string, timeout time.Duration) {
-	// Create frame writer and reader using the standard io adapter
+	// Create frame writer using the standard io adapter
 	writer := frame.NewUnwrapCbioWriter(c.conn)
-	reader := frame.NewUnwrapCbioReader(c.conn)
 
-	// Send SEND frame
-	err := writer.WriteSync(f)
-	if err != nil {
-		c.notifySendCallback(destination, err)
-		return
-	}
-
-	// Wait for RECEIPT response with timeout
+	// Create pending operation for receipt tracking
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	responseCh := make(chan *frame.Frame, 1)
 	errorCh := make(chan error, 1)
 
-	// Read response asynchronously
-	go func() {
-		for {
-			response, err := reader.ReadSync()
-			if err != nil {
-				errorCh <- err
-				return
-			}
+	pendingOp := &PendingOperation{
+		Type:       "send",
+		ReceiptID:  receiptId,
+		ResponseCh: responseCh,
+		ErrorCh:    errorCh,
+		Context:    ctx,
+		Cancel:     cancel,
+	}
 
-			// Check if this is the receipt we're waiting for
-			if response.Command == frame.RECEIPT {
-				if response.Header.Get(frame.ReceiptId) == receiptId {
-					responseCh <- response
-					return
-				}
-				// Continue reading if it's not our receipt
-			} else if response.Command == frame.ERROR {
-				errorCh <- newError(response)
-				return
-			}
-		}
-	}()
+	// Register pending operation with frame router
+	c.frameRouter.RegisterPendingOperation(pendingOp)
 
+	// Send SEND frame
+	err := writer.WriteSync(f)
+	if err != nil {
+		// Unregister pending operation on send failure
+		c.frameRouter.UnregisterPendingOperation(receiptId)
+		c.notifySendCallback(destination, err)
+		return
+	}
+
+	// Wait for RECEIPT response with timeout
 	select {
 	case <-responseCh:
 		// Receipt received, send successful
@@ -144,7 +135,8 @@ func (c *CallbackConn) performSendWithReceipt(f *frame.Frame, destination, recei
 		// Error occurred
 		c.notifySendCallback(destination, err)
 	case <-ctx.Done():
-		// Timeout occurred
+		// Timeout occurred, unregister the operation
+		c.frameRouter.UnregisterPendingOperation(receiptId)
 		c.notifySendCallback(destination, ErrSendReceiptTimeout)
 	}
 }
@@ -289,47 +281,38 @@ func (c *CallbackConn) Unsubscribe(subscription *CallbackSubscription, callback 
 
 // performUnsubscribe handles the actual unsubscription process
 func (c *CallbackConn) performUnsubscribe(unsubscribeFrame *frame.Frame, subscription *CallbackSubscription, receiptId string) {
-	// Create frame writer and reader using the standard io adapter
+	// Create frame writer using the standard io adapter
 	writer := frame.NewUnwrapCbioWriter(c.conn)
-	reader := frame.NewUnwrapCbioReader(c.conn)
 
-	// Send UNSUBSCRIBE frame
-	err := writer.WriteSync(unsubscribeFrame)
-	if err != nil {
-		c.notifySubscriptionCallback(subscription, SubscriptionError, err)
-		return
-	}
-
-	// Wait for RECEIPT response with timeout
+	// Create pending operation for receipt tracking
 	ctx, cancel := context.WithTimeout(context.Background(), c.unsubscribeReceiptTimeout)
 	defer cancel()
 
 	responseCh := make(chan *frame.Frame, 1)
 	errorCh := make(chan error, 1)
 
-	// Read response asynchronously
-	go func() {
-		for {
-			response, err := reader.ReadSync()
-			if err != nil {
-				errorCh <- err
-				return
-			}
+	pendingOp := &PendingOperation{
+		Type:       "unsubscribe",
+		ReceiptID:  receiptId,
+		ResponseCh: responseCh,
+		ErrorCh:    errorCh,
+		Context:    ctx,
+		Cancel:     cancel,
+	}
 
-			// Check if this is the receipt we're waiting for
-			if response.Command == frame.RECEIPT {
-				if response.Header.Get(frame.ReceiptId) == receiptId {
-					responseCh <- response
-					return
-				}
-				// Continue reading if it's not our receipt
-			} else if response.Command == frame.ERROR {
-				errorCh <- newError(response)
-				return
-			}
-		}
-	}()
+	// Register pending operation with frame router
+	c.frameRouter.RegisterPendingOperation(pendingOp)
 
+	// Send UNSUBSCRIBE frame
+	err := writer.WriteSync(unsubscribeFrame)
+	if err != nil {
+		// Unregister pending operation on send failure
+		c.frameRouter.UnregisterPendingOperation(receiptId)
+		c.notifySubscriptionCallback(subscription, SubscriptionError, err)
+		return
+	}
+
+	// Wait for RECEIPT response with timeout
 	select {
 	case <-responseCh:
 		// Receipt received, unsubscribe successful
@@ -339,7 +322,8 @@ func (c *CallbackConn) performUnsubscribe(unsubscribeFrame *frame.Frame, subscri
 		// Error occurred
 		c.notifySubscriptionCallback(subscription, SubscriptionError, err)
 	case <-ctx.Done():
-		// Timeout occurred
+		// Timeout occurred, unregister the operation
+		c.frameRouter.UnregisterPendingOperation(receiptId)
 		c.notifySubscriptionCallback(subscription, SubscriptionError, ErrUnsubscribeReceiptTimeout)
 	}
 }

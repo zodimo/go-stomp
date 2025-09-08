@@ -12,6 +12,184 @@ import (
 	"github.com/zodimo/go-netkit/cbio"
 )
 
+// PendingOperation represents an operation waiting for a response
+type PendingOperation struct {
+	Type       string             // "connect", "send", "subscribe", etc.
+	ReceiptID  string             // Receipt ID to match
+	ResponseCh chan *frame.Frame  // Channel to send response
+	ErrorCh    chan error         // Channel to send errors
+	Context    context.Context    // For timeout handling
+	Cancel     context.CancelFunc // Cancel function
+}
+
+// FrameRouter handles incoming frames and routes them to appropriate handlers
+type FrameRouter struct {
+	pendingOps    map[string]*PendingOperation
+	subscriptions map[string]*CallbackSubscription
+	mu            sync.RWMutex
+	stopCh        chan struct{}
+	conn          *CallbackConn // Reference to parent connection
+}
+
+// NewFrameRouter creates a new frame router
+func NewFrameRouter(conn *CallbackConn) *FrameRouter {
+	return &FrameRouter{
+		pendingOps:    make(map[string]*PendingOperation),
+		subscriptions: make(map[string]*CallbackSubscription),
+		stopCh:        make(chan struct{}),
+		conn:          conn,
+	}
+}
+
+// RegisterPendingOperation registers an operation waiting for a receipt
+func (r *FrameRouter) RegisterPendingOperation(op *PendingOperation) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.pendingOps[op.ReceiptID] = op
+}
+
+// UnregisterPendingOperation removes a pending operation
+func (r *FrameRouter) UnregisterPendingOperation(receiptID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if op, exists := r.pendingOps[receiptID]; exists {
+		if op.Cancel != nil {
+			op.Cancel()
+		}
+		delete(r.pendingOps, receiptID)
+	}
+}
+
+// RegisterSubscription registers a subscription for message routing
+func (r *FrameRouter) RegisterSubscription(subscriptionID string, sub *CallbackSubscription) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.subscriptions[subscriptionID] = sub
+}
+
+// UnregisterSubscription removes a subscription
+func (r *FrameRouter) UnregisterSubscription(subscriptionID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.subscriptions, subscriptionID)
+}
+
+// RouteFrame routes an incoming frame to the appropriate handler
+func (r *FrameRouter) RouteFrame(f *frame.Frame) {
+	switch f.Command {
+	case frame.RECEIPT:
+		r.routeReceiptFrame(f)
+	case frame.MESSAGE:
+		r.routeMessageFrame(f)
+	case frame.ERROR:
+		r.routeErrorFrame(f)
+	case frame.CONNECTED:
+		r.routeConnectedFrame(f)
+	default:
+		r.routeUnknownFrame(f)
+	}
+}
+
+// routeReceiptFrame routes RECEIPT frames to pending operations
+func (r *FrameRouter) routeReceiptFrame(f *frame.Frame) {
+	receiptID := f.Header.Get(frame.ReceiptId)
+	if receiptID == "" {
+		r.conn.log.Error("Received RECEIPT frame without receipt-id")
+		return
+	}
+
+	r.mu.Lock()
+	op, exists := r.pendingOps[receiptID]
+	if exists {
+		delete(r.pendingOps, receiptID)
+	}
+	r.mu.Unlock()
+
+	if exists {
+		select {
+		case op.ResponseCh <- f:
+			// Receipt delivered successfully
+		default:
+			// Channel full or closed, log warning
+			r.conn.log.Warning("Failed to deliver RECEIPT frame to pending operation")
+		}
+	} else {
+		r.conn.log.Warning("Received RECEIPT frame for unknown receipt-id: " + receiptID)
+	}
+}
+
+// routeMessageFrame routes MESSAGE frames to subscription handlers
+func (r *FrameRouter) routeMessageFrame(f *frame.Frame) {
+	// Delegate to existing handleMessageFrame method
+	r.conn.handleMessageFrame(f)
+}
+
+// routeErrorFrame routes ERROR frames to error callbacks
+func (r *FrameRouter) routeErrorFrame(f *frame.Frame) {
+	// Check if this error is for a pending operation
+	receiptID := f.Header.Get(frame.ReceiptId)
+	if receiptID != "" {
+		r.mu.Lock()
+		op, exists := r.pendingOps[receiptID]
+		if exists {
+			delete(r.pendingOps, receiptID)
+		}
+		r.mu.Unlock()
+
+		if exists {
+			select {
+			case op.ErrorCh <- newError(f):
+				return
+			default:
+				// Channel full or closed, fall through to general error handling
+			}
+		}
+	}
+
+	// General error handling
+	r.conn.handleConnectionError(newError(f))
+}
+
+// routeConnectedFrame routes CONNECTED frames to connection handlers
+func (r *FrameRouter) routeConnectedFrame(f *frame.Frame) {
+	// This would typically be handled during connection establishment
+	// For now, log it as unexpected since CONNECTED should only occur during connect
+	r.conn.log.Warning("Received unexpected CONNECTED frame")
+}
+
+// routeUnknownFrame handles unknown frame types gracefully
+func (r *FrameRouter) routeUnknownFrame(f *frame.Frame) {
+	r.conn.log.Warning("Received unknown frame type: " + f.Command)
+}
+
+// Stop stops the frame router and cancels all pending operations
+func (r *FrameRouter) Stop() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// Cancel all pending operations
+	for _, op := range r.pendingOps {
+		if op.Cancel != nil {
+			op.Cancel()
+		}
+		select {
+		case op.ErrorCh <- ErrClosedUnexpectedly:
+		default:
+			// Channel closed or full
+		}
+	}
+
+	// Clear maps
+	r.pendingOps = make(map[string]*PendingOperation)
+	r.subscriptions = make(map[string]*CallbackSubscription)
+
+	// Signal stop
+	select {
+	case r.stopCh <- struct{}{}:
+	default:
+	}
+}
+
 // CallbackConn represents a callback-style STOMP connection using cbio interfaces
 type CallbackConn struct {
 	// cbio interface for asynchronous I/O
@@ -72,6 +250,9 @@ type CallbackConn struct {
 	readerDone      chan struct{}
 	frameChannel    chan *frame.Frame
 	errorChannel    chan error
+
+	// Frame router for centralized frame dispatching
+	frameRouter *FrameRouter
 }
 
 // CallbackConnOption represents options for callback connections
@@ -100,6 +281,9 @@ func NewCallbackConn(conn cbio.ReadWriteCloser, opts ...CallbackConnOption) *Cal
 		frameChannel: make(chan *frame.Frame, 100), // Buffered channel for frames
 		errorChannel: make(chan error, 10),         // Buffered channel for errors
 	}
+
+	// Initialize frame router
+	c.frameRouter = NewFrameRouter(c)
 
 	// Initialize default options
 	c.options = connOptions{
@@ -683,36 +867,37 @@ func (c *CallbackConn) performDisconnect() {
 		return
 	}
 
-	// Wait for RECEIPT response with timeout using background frame reader
+	// Create pending operation for receipt tracking
 	ctx, cancel := context.WithTimeout(context.Background(), c.disconnectReceiptTimeout)
 	defer cancel()
 
-	for {
-		select {
-		case response := <-c.frameChannel:
-			if response != nil && response.Command == frame.RECEIPT {
-				if response.Header.Get(frame.ReceiptId) == receiptId {
-					// Receipt received, disconnect successful
-					c.finalizeDisconnect(nil)
-					return
-				}
-				// Continue reading if it's not our receipt
-			} else if response != nil && response.Command == frame.ERROR {
-				c.finalizeDisconnect(newError(response))
-				return
-			}
-			// Continue waiting for our receipt, ignore other frames
+	responseCh := make(chan *frame.Frame, 1)
+	errorCh := make(chan error, 1)
 
-		case err := <-c.errorChannel:
-			// Error occurred
-			c.finalizeDisconnect(err)
-			return
+	pendingOp := &PendingOperation{
+		Type:       "disconnect",
+		ReceiptID:  receiptId,
+		ResponseCh: responseCh,
+		ErrorCh:    errorCh,
+		Context:    ctx,
+		Cancel:     cancel,
+	}
 
-		case <-ctx.Done():
-			// Timeout occurred
-			c.finalizeDisconnect(ErrDisconnectReceiptTimeout)
-			return
-		}
+	// Register pending operation with frame router
+	c.frameRouter.RegisterPendingOperation(pendingOp)
+
+	// Wait for RECEIPT response with timeout
+	select {
+	case <-responseCh:
+		// Receipt received, disconnect successful
+		c.finalizeDisconnect(nil)
+	case err := <-errorCh:
+		// Error occurred
+		c.finalizeDisconnect(err)
+	case <-ctx.Done():
+		// Timeout occurred, unregister the operation
+		c.frameRouter.UnregisterPendingOperation(receiptId)
+		c.finalizeDisconnect(ErrDisconnectReceiptTimeout)
 	}
 }
 
@@ -720,6 +905,9 @@ func (c *CallbackConn) performDisconnect() {
 func (c *CallbackConn) finalizeDisconnect(err error) {
 	// Stop the background frame reader
 	c.stopFrameReader()
+
+	// Stop the frame router
+	c.frameRouter.Stop()
 
 	// Close the underlying connection
 	if closeErr := c.conn.Close(); closeErr != nil && err == nil {
@@ -809,17 +997,8 @@ func (c *CallbackConn) startMessageProcessing() {
 				continue
 			}
 
-			// Process non-heart-beat frames
-			switch f.Command {
-			case frame.MESSAGE:
-				c.handleMessageFrame(f)
-			case frame.RECEIPT:
-				// Receipt frames are handled by individual operations
-				continue
-			case frame.ERROR:
-				c.handleConnectionError(newError(f))
-				return
-			}
+			// Process non-heart-beat frames using frame router
+			c.frameRouter.RouteFrame(f)
 		}
 	}
 
