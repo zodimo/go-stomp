@@ -29,6 +29,7 @@ func (s *FrameRouterSuite) TestRegisterPendingOperation(c *C) {
 	client, _ := NewFakeConn()
 	cbioConn := cbio.WrapReadWriteCloser(client)
 	conn := NewCallbackConn(cbioConn)
+	var err error
 
 	responseCh := make(chan *frame.Frame, 1)
 	errorCh := make(chan error, 1)
@@ -44,7 +45,8 @@ func (s *FrameRouterSuite) TestRegisterPendingOperation(c *C) {
 		Cancel:     cancel,
 	}
 
-	conn.frameRouter.RegisterPendingOperation(pendingOp)
+	err = conn.frameRouter.RegisterPendingOperation(pendingOp)
+	c.Assert(err, IsNil)
 
 	// Verify operation was registered
 	conn.frameRouter.mu.RLock()
@@ -60,6 +62,7 @@ func (s *FrameRouterSuite) TestUnregisterPendingOperation(c *C) {
 	client, _ := NewFakeConn()
 	cbioConn := cbio.WrapReadWriteCloser(client)
 	conn := NewCallbackConn(cbioConn)
+	var err error
 
 	responseCh := make(chan *frame.Frame, 1)
 	errorCh := make(chan error, 1)
@@ -76,7 +79,8 @@ func (s *FrameRouterSuite) TestUnregisterPendingOperation(c *C) {
 	}
 
 	// Register then unregister
-	conn.frameRouter.RegisterPendingOperation(pendingOp)
+	err = conn.frameRouter.RegisterPendingOperation(pendingOp)
+	c.Assert(err, IsNil)
 	conn.frameRouter.UnregisterPendingOperation("test-receipt-123")
 
 	// Verify operation was unregistered
@@ -91,6 +95,7 @@ func (s *FrameRouterSuite) TestRouteReceiptFrameSuccess(c *C) {
 	client, _ := NewFakeConn()
 	cbioConn := cbio.WrapReadWriteCloser(client)
 	conn := NewCallbackConn(cbioConn)
+	var err error
 
 	responseCh := make(chan *frame.Frame, 1)
 	errorCh := make(chan error, 1)
@@ -106,7 +111,8 @@ func (s *FrameRouterSuite) TestRouteReceiptFrameSuccess(c *C) {
 		Cancel:     cancel,
 	}
 
-	conn.frameRouter.RegisterPendingOperation(pendingOp)
+	err = conn.frameRouter.RegisterPendingOperation(pendingOp)
+	c.Assert(err, IsNil)
 
 	// Create RECEIPT frame
 	receiptFrame := frame.New(frame.RECEIPT, frame.ReceiptId, "test-receipt-123")
@@ -165,6 +171,7 @@ func (s *FrameRouterSuite) TestRouteErrorFrameWithReceiptID(c *C) {
 	client, _ := NewFakeConn()
 	cbioConn := cbio.WrapReadWriteCloser(client)
 	conn := NewCallbackConn(cbioConn)
+	var err error
 
 	responseCh := make(chan *frame.Frame, 1)
 	errorCh := make(chan error, 1)
@@ -180,7 +187,8 @@ func (s *FrameRouterSuite) TestRouteErrorFrameWithReceiptID(c *C) {
 		Cancel:     cancel,
 	}
 
-	conn.frameRouter.RegisterPendingOperation(pendingOp)
+	err = conn.frameRouter.RegisterPendingOperation(pendingOp)
+	c.Assert(err, IsNil)
 
 	// Create ERROR frame with receipt-id
 	errorFrame := frame.New(frame.ERROR, frame.ReceiptId, "test-receipt-123", frame.Message, "Test error")
@@ -264,7 +272,8 @@ func (s *FrameRouterSuite) TestConcurrentPendingOperations(c *C) {
 				Cancel:     cancel,
 			}
 
-			conn.frameRouter.RegisterPendingOperation(pendingOp)
+			err := conn.frameRouter.RegisterPendingOperation(pendingOp)
+			c.Assert(err, IsNil)
 
 			// Create and route RECEIPT frame
 			receiptFrame := frame.New(frame.RECEIPT, frame.ReceiptId, receiptID)
@@ -295,6 +304,7 @@ func (s *FrameRouterSuite) TestFrameRouterStop(c *C) {
 	client, _ := NewFakeConn()
 	cbioConn := cbio.WrapReadWriteCloser(client)
 	conn := NewCallbackConn(cbioConn)
+	var err error
 
 	responseCh := make(chan *frame.Frame, 1)
 	errorCh := make(chan error, 1)
@@ -310,7 +320,8 @@ func (s *FrameRouterSuite) TestFrameRouterStop(c *C) {
 		Cancel:     cancel,
 	}
 
-	conn.frameRouter.RegisterPendingOperation(pendingOp)
+	err = conn.frameRouter.RegisterPendingOperation(pendingOp)
+	c.Assert(err, IsNil)
 
 	// Stop the frame router
 	conn.frameRouter.Stop()
@@ -364,4 +375,131 @@ func (s *FrameRouterSuite) TestSubscriptionRegistration(c *C) {
 	conn.frameRouter.mu.RUnlock()
 
 	c.Assert(exists, Equals, false)
+}
+
+func (s *FrameRouterSuite) TestTimeoutMonitoringStatus(c *C) {
+	client, _ := NewFakeConn()
+	cbioConn := cbio.WrapReadWriteCloser(client)
+	conn := NewCallbackConn(cbioConn)
+
+	// Give the timeout monitor goroutine a moment to start
+	time.Sleep(10 * time.Millisecond)
+
+	// Timeout monitor should be running after creation
+	c.Assert(conn.frameRouter.GetTimeoutMonitorStatus(), Equals, true)
+
+	// Test pending operation count
+	c.Assert(conn.frameRouter.GetPendingOperationCount(), Equals, 0)
+
+	// Test operation timeouts configuration
+	timeouts := conn.frameRouter.GetOperationTimeouts()
+	c.Assert(timeouts, NotNil)
+	c.Assert(timeouts.Connect, Equals, 30*time.Second)
+	c.Assert(timeouts.Send, Equals, 10*time.Second)
+
+	// Test setting operation timeouts
+	newTimeouts := &OperationTimeoutConfig{
+		Connect:     60 * time.Second,
+		Send:        20 * time.Second,
+		Subscribe:   15 * time.Second,
+		Unsubscribe: 15 * time.Second,
+		Disconnect:  20 * time.Second,
+		Ack:         10 * time.Second,
+	}
+	conn.frameRouter.SetOperationTimeouts(newTimeouts)
+
+	updatedTimeouts := conn.frameRouter.GetOperationTimeouts()
+	c.Assert(updatedTimeouts.Connect, Equals, 60*time.Second)
+	c.Assert(updatedTimeouts.Send, Equals, 20*time.Second)
+}
+
+func (s *FrameRouterSuite) TestOperationDoubleRegistration(c *C) {
+	client, _ := NewFakeConn()
+	cbioConn := cbio.WrapReadWriteCloser(client)
+	conn := NewCallbackConn(cbioConn)
+
+	responseCh := make(chan *frame.Frame, 1)
+	errorCh := make(chan error, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	pendingOp := &PendingOperation{
+		Type:       "send",
+		ReceiptID:  "test-receipt-duplicate",
+		ResponseCh: responseCh,
+		ErrorCh:    errorCh,
+		Context:    ctx,
+		Cancel:     cancel,
+	}
+
+	// First registration should succeed
+	err := conn.frameRouter.RegisterPendingOperation(pendingOp)
+	c.Assert(err, IsNil)
+
+	// Second registration with same receipt ID should fail
+	err = conn.frameRouter.RegisterPendingOperation(pendingOp)
+	c.Assert(err, NotNil)
+	c.Assert(err.Error(), Matches, ".*already exists.*")
+}
+
+func (s *FrameRouterSuite) TestOperationValidation(c *C) {
+	client, _ := NewFakeConn()
+	cbioConn := cbio.WrapReadWriteCloser(client)
+	conn := NewCallbackConn(cbioConn)
+
+	// Test nil operation
+	err := conn.frameRouter.RegisterPendingOperation(nil)
+	c.Assert(err, NotNil)
+	c.Assert(err.Error(), Matches, ".*nil pending operation.*")
+
+	// Test empty receipt ID
+	pendingOp := &PendingOperation{
+		Type:      "send",
+		ReceiptID: "",
+	}
+	err = conn.frameRouter.RegisterPendingOperation(pendingOp)
+	c.Assert(err, NotNil)
+	c.Assert(err.Error(), Matches, ".*empty receipt ID.*")
+}
+
+func (s *FrameRouterSuite) TestTimeoutCleanup(c *C) {
+	client, _ := NewFakeConn()
+	cbioConn := cbio.WrapReadWriteCloser(client)
+	conn := NewCallbackConn(cbioConn)
+
+	// Create an operation with very short timeout
+	responseCh := make(chan *frame.Frame, 1)
+	errorCh := make(chan error, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	pendingOp := &PendingOperation{
+		Type:       "send",
+		ReceiptID:  "test-timeout-cleanup",
+		ResponseCh: responseCh,
+		ErrorCh:    errorCh,
+		Context:    ctx,
+		Cancel:     cancel,
+	}
+
+	err := conn.frameRouter.RegisterPendingOperation(pendingOp)
+	c.Assert(err, IsNil)
+
+	// Wait for timeout
+	time.Sleep(50 * time.Millisecond)
+
+	// Manually trigger cleanup
+	conn.frameRouter.cleanupExpiredOperations()
+
+	// Operation should be removed
+	count := conn.frameRouter.GetPendingOperationCount()
+	c.Assert(count, Equals, 0)
+
+	// Error channel should receive timeout error
+	select {
+	case receivedErr := <-errorCh:
+		c.Assert(receivedErr, Equals, context.DeadlineExceeded)
+	case <-time.After(100 * time.Millisecond):
+		c.Fatal("Expected timeout error not received")
+	}
 }

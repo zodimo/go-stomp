@@ -12,6 +12,28 @@ import (
 	"github.com/zodimo/go-netkit/cbio"
 )
 
+// OperationTimeoutConfig holds timeout values for different operation types
+type OperationTimeoutConfig struct {
+	Connect     time.Duration
+	Send        time.Duration
+	Subscribe   time.Duration
+	Unsubscribe time.Duration
+	Disconnect  time.Duration
+	Ack         time.Duration
+}
+
+// DefaultOperationTimeouts returns default timeout values for operations
+func DefaultOperationTimeouts() *OperationTimeoutConfig {
+	return &OperationTimeoutConfig{
+		Connect:     30 * time.Second,
+		Send:        10 * time.Second,
+		Subscribe:   10 * time.Second,
+		Unsubscribe: 10 * time.Second,
+		Disconnect:  10 * time.Second,
+		Ack:         5 * time.Second,
+	}
+}
+
 // PendingOperation represents an operation waiting for a response
 type PendingOperation struct {
 	Type       string             // "connect", "send", "subscribe", etc.
@@ -29,23 +51,55 @@ type FrameRouter struct {
 	mu            sync.RWMutex
 	stopCh        chan struct{}
 	conn          *CallbackConn // Reference to parent connection
+
+	// Timeout monitoring
+	timeoutMonitorRunning bool
+	cleanupInterval       time.Duration
+	operationTimeouts     *OperationTimeoutConfig
 }
 
 // NewFrameRouter creates a new frame router
 func NewFrameRouter(conn *CallbackConn) *FrameRouter {
-	return &FrameRouter{
-		pendingOps:    make(map[string]*PendingOperation),
-		subscriptions: make(map[string]*CallbackSubscription),
-		stopCh:        make(chan struct{}),
-		conn:          conn,
+	router := &FrameRouter{
+		pendingOps:        make(map[string]*PendingOperation),
+		subscriptions:     make(map[string]*CallbackSubscription),
+		stopCh:            make(chan struct{}),
+		conn:              conn,
+		cleanupInterval:   30 * time.Second, // Default cleanup every 30 seconds
+		operationTimeouts: DefaultOperationTimeouts(),
 	}
+
+	// Start timeout monitoring goroutine
+	go router.timeoutMonitorLoop()
+
+	return router
 }
 
 // RegisterPendingOperation registers an operation waiting for a receipt
-func (r *FrameRouter) RegisterPendingOperation(op *PendingOperation) {
+// Returns an error if the operation ID already exists (prevents double registration)
+func (r *FrameRouter) RegisterPendingOperation(op *PendingOperation) error {
+	if op == nil {
+		return fmt.Errorf("cannot register nil pending operation")
+	}
+	if op.ReceiptID == "" {
+		return fmt.Errorf("cannot register pending operation with empty receipt ID")
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	// Check for duplicate registration
+	if _, exists := r.pendingOps[op.ReceiptID]; exists {
+		return fmt.Errorf("operation with receipt ID %s already exists", op.ReceiptID)
+	}
+
 	r.pendingOps[op.ReceiptID] = op
+
+	if r.conn.log != nil {
+		r.conn.log.Debugf("registered %s operation with receipt %s", op.Type, op.ReceiptID)
+	}
+
+	return nil
 }
 
 // UnregisterPendingOperation removes a pending operation
@@ -188,6 +242,113 @@ func (r *FrameRouter) Stop() {
 	case r.stopCh <- struct{}{}:
 	default:
 	}
+}
+
+// timeoutMonitorLoop monitors pending operations for timeouts and cleans up expired operations
+func (r *FrameRouter) timeoutMonitorLoop() {
+	r.mu.Lock()
+	r.timeoutMonitorRunning = true
+	r.mu.Unlock()
+
+	ticker := time.NewTicker(r.cleanupInterval)
+	defer ticker.Stop()
+
+	if r.conn.log != nil {
+		r.conn.log.Debug("timeout monitor started")
+	}
+
+	for {
+		select {
+		case <-r.stopCh:
+			r.mu.Lock()
+			r.timeoutMonitorRunning = false
+			r.mu.Unlock()
+			if r.conn.log != nil {
+				r.conn.log.Debug("timeout monitor stopped")
+			}
+			return
+
+		case <-ticker.C:
+			r.cleanupExpiredOperations()
+		}
+	}
+}
+
+// cleanupExpiredOperations removes expired pending operations
+func (r *FrameRouter) cleanupExpiredOperations() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	expiredCount := 0
+	for receiptID, op := range r.pendingOps {
+		select {
+		case <-op.Context.Done():
+			// Operation has timed out
+			expiredCount++
+
+			// Send timeout error to the operation
+			select {
+			case op.ErrorCh <- context.DeadlineExceeded:
+			default:
+				// Error channel closed or full
+			}
+
+			// Cancel the operation
+			if op.Cancel != nil {
+				op.Cancel()
+			}
+
+			// Remove from pending operations
+			delete(r.pendingOps, receiptID)
+
+			if r.conn.log != nil {
+				r.conn.log.Debugf("cleaned up expired %s operation with receipt %s", op.Type, receiptID)
+			}
+
+		default:
+			// Operation is still active
+		}
+	}
+
+	if expiredCount > 0 && r.conn.log != nil {
+		r.conn.log.Debugf("cleaned up %d expired operations", expiredCount)
+	}
+}
+
+// GetTimeoutMonitorStatus returns the current status of the timeout monitor
+func (r *FrameRouter) GetTimeoutMonitorStatus() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.timeoutMonitorRunning
+}
+
+// GetPendingOperationCount returns the number of pending operations
+func (r *FrameRouter) GetPendingOperationCount() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.pendingOps)
+}
+
+// GetOperationTimeouts returns the current operation timeout configuration
+func (r *FrameRouter) GetOperationTimeouts() *OperationTimeoutConfig {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	// Return a copy to prevent external modification
+	return &OperationTimeoutConfig{
+		Connect:     r.operationTimeouts.Connect,
+		Send:        r.operationTimeouts.Send,
+		Subscribe:   r.operationTimeouts.Subscribe,
+		Unsubscribe: r.operationTimeouts.Unsubscribe,
+		Disconnect:  r.operationTimeouts.Disconnect,
+		Ack:         r.operationTimeouts.Ack,
+	}
+}
+
+// SetOperationTimeouts updates the operation timeout configuration
+func (r *FrameRouter) SetOperationTimeouts(timeouts *OperationTimeoutConfig) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.operationTimeouts = timeouts
 }
 
 // CallbackConn represents a callback-style STOMP connection using cbio interfaces
@@ -884,7 +1045,11 @@ func (c *CallbackConn) performDisconnect() {
 	}
 
 	// Register pending operation with frame router
-	c.frameRouter.RegisterPendingOperation(pendingOp)
+	err = c.frameRouter.RegisterPendingOperation(pendingOp)
+	if err != nil {
+		c.finalizeDisconnect(err)
+		return
+	}
 
 	// Wait for RECEIPT response with timeout
 	select {

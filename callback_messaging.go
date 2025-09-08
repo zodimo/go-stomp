@@ -115,10 +115,15 @@ func (c *CallbackConn) performSendWithReceipt(f *frame.Frame, destination, recei
 	}
 
 	// Register pending operation with frame router
-	c.frameRouter.RegisterPendingOperation(pendingOp)
+	var err error
+	err = c.frameRouter.RegisterPendingOperation(pendingOp)
+	if err != nil {
+		c.notifySendCallback(destination, err)
+		return
+	}
 
 	// Send SEND frame
-	err := writer.WriteSync(f)
+	err = writer.WriteSync(f)
 	if err != nil {
 		// Unregister pending operation on send failure
 		c.frameRouter.UnregisterPendingOperation(receiptId)
@@ -301,10 +306,15 @@ func (c *CallbackConn) performUnsubscribe(unsubscribeFrame *frame.Frame, subscri
 	}
 
 	// Register pending operation with frame router
-	c.frameRouter.RegisterPendingOperation(pendingOp)
+	var err error
+	err = c.frameRouter.RegisterPendingOperation(pendingOp)
+	if err != nil {
+		c.notifySubscriptionCallback(subscription, SubscriptionError, err)
+		return
+	}
 
 	// Send UNSUBSCRIBE frame
-	err := writer.WriteSync(unsubscribeFrame)
+	err = writer.WriteSync(unsubscribeFrame)
 	if err != nil {
 		// Unregister pending operation on send failure
 		c.frameRouter.UnregisterPendingOperation(receiptId)
