@@ -483,20 +483,22 @@ func (c *CallbackConn) createCallbackAckNackFrame(msg *CallbackMessage, ack bool
 		f = frame.New(frame.NACK)
 	}
 
-	switch msg.Subscription.AckMode() {
-	case AckClient:
+	switch c.version {
+	case V10, V11:
+		f.Header.Add(frame.Subscription, msg.Subscription.Id())
 		if messageId, ok := msg.Header.Contains(frame.MessageId); ok {
-			f.Header.Set(frame.MessageId, messageId)
+			f.Header.Add(frame.MessageId, messageId)
+		} else {
+			return nil, missingHeader(frame.MessageId)
 		}
-	case AckClientIndividual:
-		if messageId, ok := msg.Header.Contains(frame.MessageId); ok {
-			f.Header.Set(frame.MessageId, messageId)
+	case V12:
+		// message frame contains ack header
+		if ackId, ok := msg.Header.Contains(frame.Ack); ok {
+			// ack frame should reference it as id
+			f.Header.Add(frame.Id, ackId)
+		} else {
+			return nil, missingHeader(frame.Ack)
 		}
-	}
-
-	// Set subscription header for STOMP 1.1 and later
-	if c.version != V10 {
-		f.Header.Set(frame.Subscription, msg.Subscription.Id())
 	}
 
 	return f, nil

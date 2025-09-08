@@ -580,7 +580,7 @@ func (c *CallbackConn) startMessageProcessing() {
 
 	// Set up heart-beat timers if configured
 	if c.readTimeout > 0 {
-		readTimer = time.NewTimer(c.readTimeout)
+		readTimer = time.NewTimer(time.Duration(float64(c.readTimeout) * c.hbGracePeriodMultiplier))
 		readTimeoutChannel = readTimer.C
 	}
 	if c.writeTimeout > 0 {
@@ -644,7 +644,7 @@ func (c *CallbackConn) startMessageProcessing() {
 		case f := <-frameCh:
 			// Reset read timer when we receive any frame
 			if readTimer != nil {
-				readTimer.Reset(c.readTimeout)
+				readTimer.Reset(time.Duration(float64(c.readTimeout) * c.hbGracePeriodMultiplier))
 			}
 
 			// Update frame statistics
@@ -712,11 +712,17 @@ func (c *CallbackConn) handleMessageFrame(f *frame.Frame) {
 		ContentType:  f.Header.Get(frame.ContentType),
 	}
 
-	// Set ack ID based on acknowledgment mode and protocol version
-	switch subscription.ackMode {
-	case AckClient, AckClientIndividual:
-		if messageId, ok := f.Header.Contains(frame.MessageId); ok {
-			message.ackId = messageId
+	// Set ack ID based on protocol version and acknowledgment mode
+	if subscription.ackMode != AckAuto {
+		switch c.version {
+		case V10, V11:
+			if messageId, ok := f.Header.Contains(frame.MessageId); ok {
+				message.ackId = messageId
+			}
+		case V12:
+			if ackId, ok := f.Header.Contains(frame.Ack); ok {
+				message.ackId = ackId
+			}
 		}
 	}
 
