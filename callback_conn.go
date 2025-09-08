@@ -38,10 +38,14 @@ type CallbackConn struct {
 	hbGracePeriodMultiplier   float64
 
 	// Callback handlers
-	connectCallback     ConnectCallback
-	disconnectCallback  DisconnectCallback
-	stateChangeCallback StateChangeCallback
-	errorCallback       ErrorCallback
+	connectCallback       ConnectCallback
+	disconnectCallback    DisconnectCallback
+	stateChangeCallback   StateChangeCallback
+	errorCallback         ErrorCallback
+	heartBeatCallback     HeartBeatCallback
+	healthStatusCallback  HealthStatusCallback
+	errorRecoveryCallback ErrorRecoveryCallback
+	shutdownCallback      ShutdownCallback
 
 	// Message handling
 	subscriptions        map[string]*CallbackSubscription
@@ -49,6 +53,14 @@ type CallbackConn struct {
 	sendCallback         SendCallback
 	subscriptionCallback SubscriptionCallback
 	ackCallback          AckCallback
+
+	// Health monitoring and statistics
+	healthStatus ConnectionHealth
+	stats        CallbackConnectionStats
+
+	// Transaction support
+	transactions        map[string]*CallbackTransaction
+	transactionCallback TransactionCallback
 
 	// Connection options
 	options connOptions
@@ -74,6 +86,10 @@ func NewCallbackConn(conn io.ReadWriteCloser, opts ...CallbackConnOption) *Callb
 		// Initialize message handling maps
 		subscriptions:   make(map[string]*CallbackSubscription),
 		messageHandlers: make(map[string]MessageHandler),
+		// Initialize transaction maps
+		transactions: make(map[string]*CallbackTransaction),
+		// Initialize health status
+		healthStatus: HealthUnknown,
 	}
 
 	// Initialize default options
@@ -141,6 +157,55 @@ func (c *CallbackConn) SetAckCallback(callback AckCallback) {
 	c.ackCallback = callback
 }
 
+// SetHeartBeatCallback sets the callback for heart-beat events
+func (c *CallbackConn) SetHeartBeatCallback(callback HeartBeatCallback) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.heartBeatCallback = callback
+}
+
+// SetHealthStatusCallback sets the callback for health status changes
+func (c *CallbackConn) SetHealthStatusCallback(callback HealthStatusCallback) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.healthStatusCallback = callback
+}
+
+// SetErrorRecoveryCallback sets the callback for error recovery decisions
+func (c *CallbackConn) SetErrorRecoveryCallback(callback ErrorRecoveryCallback) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.errorRecoveryCallback = callback
+}
+
+// SetShutdownCallback sets the callback for shutdown notifications
+func (c *CallbackConn) SetShutdownCallback(callback ShutdownCallback) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.shutdownCallback = callback
+}
+
+// SetTransactionCallback sets the callback for transaction events
+func (c *CallbackConn) SetTransactionCallback(callback TransactionCallback) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.transactionCallback = callback
+}
+
+// GetHealthStatus returns the current connection health status
+func (c *CallbackConn) GetHealthStatus() ConnectionHealth {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.healthStatus
+}
+
+// GetConnectionStats returns a copy of the current connection statistics
+func (c *CallbackConn) GetConnectionStats() CallbackConnectionStats {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.stats
+}
+
 // setState changes the connection state and notifies callbacks
 func (c *CallbackConn) setState(newState ConnectionState) {
 	c.mu.Lock()
@@ -153,6 +218,36 @@ func (c *CallbackConn) setState(newState ConnectionState) {
 	if stateCallback != nil && oldState != newState {
 		stateCallback(c, oldState, newState)
 	}
+
+	// Update health status based on connection state
+	var newHealth ConnectionHealth
+	switch newState {
+	case Disconnected:
+		newHealth = HealthDisconnected
+	case Connecting:
+		newHealth = HealthConnecting
+	case Connected:
+		newHealth = HealthHealthy
+	case Disconnecting:
+		newHealth = HealthDegraded
+	default:
+		newHealth = HealthUnknown
+	}
+	c.setHealthStatus(newHealth)
+}
+
+// setHealthStatus changes the health status and notifies callbacks
+func (c *CallbackConn) setHealthStatus(newStatus ConnectionHealth) {
+	c.mu.Lock()
+	oldStatus := c.healthStatus
+	c.healthStatus = newStatus
+	healthCallback := c.healthStatusCallback
+	c.mu.Unlock()
+
+	// Call health status callback if set and status changed
+	if healthCallback != nil && oldStatus != newStatus {
+		healthCallback(c, oldStatus, newStatus)
+	}
 }
 
 // notifyError calls the error callback if set
@@ -161,8 +256,38 @@ func (c *CallbackConn) notifyError(err error) {
 	errorCallback := c.errorCallback
 	c.mu.RUnlock()
 
+	// Update stats
+	if err != nil {
+		c.mu.Lock()
+		c.stats.LastError = err
+		c.mu.Unlock()
+	}
+
 	if errorCallback != nil {
 		errorCallback(c, err)
+	}
+}
+
+// notifyHeartBeat calls the heart-beat callback if set
+func (c *CallbackConn) notifyHeartBeat(event HeartBeatEvent, err error) {
+	c.mu.RLock()
+	heartBeatCallback := c.heartBeatCallback
+	c.mu.RUnlock()
+
+	// Update statistics based on event
+	c.mu.Lock()
+	switch event {
+	case HeartBeatSent:
+		c.stats.HeartBeatsSent++
+		c.stats.LastHeartBeatSent = time.Now()
+	case HeartBeatReceived:
+		c.stats.HeartBeatsReceived++
+		c.stats.LastHeartBeatReceived = time.Now()
+	}
+	c.mu.Unlock()
+
+	if heartBeatCallback != nil {
+		heartBeatCallback(c, event, err)
 	}
 }
 
@@ -321,10 +446,18 @@ func (c *CallbackConn) handleConnectResponse(response *frame.Frame) {
 			// Reduce time from the write timeout
 			c.writeTimeout -= DefaultHeartBeatError
 		}
+
+		// Notify heart-beat callback
+		c.notifyHeartBeat(HeartBeatNegotiated, nil)
 	}
 
 	// Connection successful
 	c.setState(Connected)
+
+	// Initialize connection statistics
+	c.mu.Lock()
+	c.stats.ConnectedAt = time.Now()
+	c.mu.Unlock()
 
 	// Start message processing loop
 	go c.startMessageProcessing()
@@ -440,33 +573,117 @@ func (c *CallbackConn) finalizeDisconnect(err error) {
 	}
 }
 
-// startMessageProcessing starts the message processing loop
+// startMessageProcessing starts the message processing loop with heart-beat monitoring
 func (c *CallbackConn) startMessageProcessing() {
 	reader := frame.NewReader(c.ioAdapter)
+	writer := frame.NewWriter(c.ioAdapter)
 
+	var readTimeoutChannel <-chan time.Time
+	var writeTimeoutChannel <-chan time.Time
+	var readTimer *time.Timer
+	var writeTimer *time.Timer
+
+	// Set up heart-beat timers if configured
+	if c.readTimeout > 0 {
+		readTimer = time.NewTimer(c.readTimeout)
+		readTimeoutChannel = readTimer.C
+	}
+	if c.writeTimeout > 0 {
+		writeTimer = time.NewTimer(c.writeTimeout)
+		writeTimeoutChannel = writeTimer.C
+	}
+
+	// Create channel for incoming frames
+	frameCh := make(chan *frame.Frame, 1)
+	errorCh := make(chan error, 1)
+
+	// Start frame reading goroutine
+	go func() {
+		for c.GetState() == Connected {
+			f, err := reader.Read()
+			if err != nil {
+				errorCh <- err
+				return
+			}
+			frameCh <- f
+		}
+	}()
+
+	// Main processing loop with heart-beat monitoring
 	for c.GetState() == Connected {
-		f, err := reader.Read()
-		if err != nil {
-			c.notifyError(err)
-			break
-		}
-
-		if f == nil {
-			// heart-beat received
-			continue
-		}
-
-		switch f.Command {
-		case frame.MESSAGE:
-			c.handleMessageFrame(f)
-		case frame.RECEIPT:
-			// Receipt frames are handled by individual operations
-			continue
-		case frame.ERROR:
-			c.notifyError(newError(f))
+		select {
+		case <-readTimeoutChannel:
+			// Read timeout - heart-beat not received in time
+			c.notifyHeartBeat(HeartBeatTimeout, ErrClosedUnexpectedly)
+			c.setHealthStatus(HealthUnhealthy)
+			c.notifyError(newErrorMessage("read timeout"))
 			c.setState(Disconnected)
 			return
+
+		case <-writeTimeoutChannel:
+			// Write timeout - send heart-beat frame
+			err := writer.Write(nil)
+			if err != nil {
+				c.notifyError(err)
+				c.setState(Disconnected)
+				return
+			}
+			c.notifyHeartBeat(HeartBeatSent, nil)
+
+			// Update frame statistics
+			c.mu.Lock()
+			c.stats.FramesSent++
+			c.mu.Unlock()
+
+			// Reset write timer
+			if writeTimer != nil {
+				writeTimer.Reset(c.writeTimeout)
+			}
+
+		case err := <-errorCh:
+			// Error reading frame
+			c.notifyError(err)
+			c.setState(Disconnected)
+			return
+
+		case f := <-frameCh:
+			// Reset read timer when we receive any frame
+			if readTimer != nil {
+				readTimer.Reset(c.readTimeout)
+			}
+
+			// Update frame statistics
+			c.mu.Lock()
+			c.stats.FramesReceived++
+			c.mu.Unlock()
+
+			if f == nil {
+				// Heart-beat frame received
+				c.notifyHeartBeat(HeartBeatReceived, nil)
+				continue
+			}
+
+			// Process non-heart-beat frames
+			switch f.Command {
+			case frame.MESSAGE:
+				c.handleMessageFrame(f)
+			case frame.RECEIPT:
+				// Receipt frames are handled by individual operations
+				continue
+			case frame.ERROR:
+				c.notifyError(newError(f))
+				c.setState(Disconnected)
+				return
+			}
 		}
+	}
+
+	// Clean up timers
+	if readTimer != nil {
+		readTimer.Stop()
+	}
+	if writeTimer != nil {
+		writeTimer.Stop()
 	}
 }
 
@@ -510,4 +727,106 @@ func (c *CallbackConn) handleMessageFrame(f *frame.Frame) {
 
 	// Call the message handler asynchronously to avoid blocking the processing loop
 	go handler(c, message)
+}
+
+// Begin starts a new transaction and returns a CallbackTransaction
+func (c *CallbackConn) Begin(callback TransactionCallback) (*CallbackTransaction, error) {
+	if c.GetState() != Connected {
+		return nil, ErrNotConnected
+	}
+
+	// Generate transaction ID
+	id := allocateId()
+
+	// Create transaction
+	tx := &CallbackTransaction{
+		id:       id,
+		conn:     c,
+		state:    TxStateActive,
+		callback: callback,
+	}
+
+	// Store transaction
+	c.mu.Lock()
+	c.transactions[id] = tx
+	c.mu.Unlock()
+
+	// Create and send BEGIN frame
+	beginFrame := frame.New(frame.BEGIN, frame.Transaction, id)
+	writer := frame.NewWriter(c.ioAdapter)
+	err := writer.Write(beginFrame)
+	if err != nil {
+		// Remove transaction from map on error
+		c.mu.Lock()
+		delete(c.transactions, id)
+		c.mu.Unlock()
+		return nil, err
+	}
+
+	// Update statistics
+	c.mu.Lock()
+	c.stats.FramesSent++
+	c.mu.Unlock()
+
+	// Notify callback asynchronously
+	if callback != nil {
+		go callback(c, tx, TransactionBegan, nil)
+	}
+
+	return tx, nil
+}
+
+// Close initiates graceful shutdown with callback notification
+func (c *CallbackConn) Close(shutdownCallback ShutdownCallback) error {
+	currentState := c.GetState()
+	if currentState == Disconnected {
+		if shutdownCallback != nil {
+			go shutdownCallback(c, ErrAlreadyClosed)
+		}
+		return ErrAlreadyClosed
+	}
+	if currentState == Disconnecting {
+		return nil // Already shutting down
+	}
+
+	// Store shutdown callback
+	c.mu.Lock()
+	c.shutdownCallback = shutdownCallback
+	c.mu.Unlock()
+
+	// Clean up pending transactions
+	c.cleanupTransactions()
+
+	// Initiate disconnect process
+	return c.Disconnect(func(conn *CallbackConn, err error) {
+		// Call shutdown callback when disconnect completes
+		c.mu.RLock()
+		callback := c.shutdownCallback
+		c.mu.RUnlock()
+
+		if callback != nil {
+			callback(conn, err)
+		}
+	})
+}
+
+// cleanupTransactions handles cleanup of pending transactions during shutdown
+func (c *CallbackConn) cleanupTransactions() {
+	c.mu.Lock()
+	transactions := make([]*CallbackTransaction, 0, len(c.transactions))
+	for _, tx := range c.transactions {
+		transactions = append(transactions, tx)
+	}
+	// Clear the transactions map
+	c.transactions = make(map[string]*CallbackTransaction)
+	c.mu.Unlock()
+
+	// Notify all pending transactions about shutdown
+	shutdownErr := newErrorMessage("connection shutting down")
+	for _, tx := range transactions {
+		tx.state = TxStateAborted
+		if tx.callback != nil {
+			go tx.callback(c, tx, TransactionError, shutdownErr)
+		}
+	}
 }

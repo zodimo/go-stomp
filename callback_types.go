@@ -1,6 +1,8 @@
 package stomp
 
 import (
+	"time"
+
 	"github.com/go-stomp/stomp/v3/frame"
 )
 
@@ -142,4 +144,242 @@ func (msg *CallbackMessage) ShouldAck() bool {
 		return false
 	}
 	return msg.Subscription.AckMode() != AckAuto
+}
+
+// HeartBeatEvent represents the type of heart-beat event
+type HeartBeatEvent int
+
+const (
+	// HeartBeatNegotiated indicates heart-beat parameters were negotiated
+	HeartBeatNegotiated HeartBeatEvent = iota
+	// HeartBeatSent indicates a heart-beat frame was sent
+	HeartBeatSent
+	// HeartBeatReceived indicates a heart-beat frame was received
+	HeartBeatReceived
+	// HeartBeatTimeout indicates a heart-beat timeout occurred
+	HeartBeatTimeout
+)
+
+// String returns a string representation of the heart-beat event
+func (hbe HeartBeatEvent) String() string {
+	switch hbe {
+	case HeartBeatNegotiated:
+		return "Negotiated"
+	case HeartBeatSent:
+		return "Sent"
+	case HeartBeatReceived:
+		return "Received"
+	case HeartBeatTimeout:
+		return "Timeout"
+	default:
+		return "Unknown"
+	}
+}
+
+// TransactionEvent represents the type of transaction event
+type TransactionEvent int
+
+const (
+	// TransactionBegan indicates a transaction was started
+	TransactionBegan TransactionEvent = iota
+	// TransactionCommitted indicates a transaction was committed
+	TransactionCommitted
+	// TransactionAborted indicates a transaction was aborted
+	TransactionAborted
+	// TransactionError indicates an error occurred with the transaction
+	TransactionError
+)
+
+// String returns a string representation of the transaction event
+func (te TransactionEvent) String() string {
+	switch te {
+	case TransactionBegan:
+		return "Began"
+	case TransactionCommitted:
+		return "Committed"
+	case TransactionAborted:
+		return "Aborted"
+	case TransactionError:
+		return "Error"
+	default:
+		return "Unknown"
+	}
+}
+
+// ConnectionHealth represents the health status of a connection
+type ConnectionHealth int
+
+const (
+	// HealthUnknown indicates the health status is unknown
+	HealthUnknown ConnectionHealth = iota
+	// HealthConnecting indicates the connection is being established
+	HealthConnecting
+	// HealthHealthy indicates the connection is healthy and operational
+	HealthHealthy
+	// HealthDegraded indicates the connection has issues but is still operational
+	HealthDegraded
+	// HealthUnhealthy indicates the connection has serious issues
+	HealthUnhealthy
+	// HealthDisconnected indicates the connection is disconnected
+	HealthDisconnected
+)
+
+// String returns a string representation of the connection health
+func (ch ConnectionHealth) String() string {
+	switch ch {
+	case HealthUnknown:
+		return "Unknown"
+	case HealthConnecting:
+		return "Connecting"
+	case HealthHealthy:
+		return "Healthy"
+	case HealthDegraded:
+		return "Degraded"
+	case HealthUnhealthy:
+		return "Unhealthy"
+	case HealthDisconnected:
+		return "Disconnected"
+	default:
+		return "Unknown"
+	}
+}
+
+// RecoveryAction represents the type of recovery action
+type RecoveryAction int
+
+const (
+	// RecoveryReconnect indicates a reconnection attempt should be made
+	RecoveryReconnect RecoveryAction = iota
+	// RecoveryRetry indicates the operation should be retried
+	RecoveryRetry
+	// RecoverySkip indicates the operation should be skipped
+	RecoverySkip
+	// RecoveryFail indicates the operation should fail
+	RecoveryFail
+)
+
+// String returns a string representation of the recovery action
+func (ra RecoveryAction) String() string {
+	switch ra {
+	case RecoveryReconnect:
+		return "Reconnect"
+	case RecoveryRetry:
+		return "Retry"
+	case RecoverySkip:
+		return "Skip"
+	case RecoveryFail:
+		return "Fail"
+	default:
+		return "Unknown"
+	}
+}
+
+// RecoveryDecision represents the decision made by error recovery callback
+type RecoveryDecision int
+
+const (
+	// DecisionProceed indicates to proceed with the suggested recovery action
+	DecisionProceed RecoveryDecision = iota
+	// DecisionRetry indicates to retry the recovery action
+	DecisionRetry
+	// DecisionAbort indicates to abort the recovery action
+	DecisionAbort
+)
+
+// String returns a string representation of the recovery decision
+func (rd RecoveryDecision) String() string {
+	switch rd {
+	case DecisionProceed:
+		return "Proceed"
+	case DecisionRetry:
+		return "Retry"
+	case DecisionAbort:
+		return "Abort"
+	default:
+		return "Unknown"
+	}
+}
+
+// TransactionState represents the state of a transaction
+type TransactionState int
+
+const (
+	// TxStateActive indicates the transaction is active
+	TxStateActive TransactionState = iota
+	// TxStateCommitted indicates the transaction has been committed
+	TxStateCommitted
+	// TxStateAborted indicates the transaction has been aborted
+	TxStateAborted
+)
+
+// String returns a string representation of the transaction state
+func (ts TransactionState) String() string {
+	switch ts {
+	case TxStateActive:
+		return "Active"
+	case TxStateCommitted:
+		return "Committed"
+	case TxStateAborted:
+		return "Aborted"
+	default:
+		return "Unknown"
+	}
+}
+
+// HeartBeatCallback is called for heart-beat events
+type HeartBeatCallback func(conn *CallbackConn, event HeartBeatEvent, err error)
+
+// TransactionCallback is called for transaction events
+type TransactionCallback func(conn *CallbackConn, tx *CallbackTransaction, event TransactionEvent, err error)
+
+// ErrorRecoveryCallback is called when an error occurs and recovery options are available
+type ErrorRecoveryCallback func(conn *CallbackConn, err error, recoveryAction RecoveryAction) RecoveryDecision
+
+// HealthStatusCallback is called when the connection health status changes
+type HealthStatusCallback func(conn *CallbackConn, oldStatus, newStatus ConnectionHealth)
+
+// ShutdownCallback is called when the connection is being shut down
+type ShutdownCallback func(conn *CallbackConn, err error)
+
+// CallbackConnectionStats contains connection statistics for callback connections
+type CallbackConnectionStats struct {
+	// FramesSent is the number of frames sent
+	FramesSent int64
+	// FramesReceived is the number of frames received
+	FramesReceived int64
+	// HeartBeatsSent is the number of heart-beat frames sent
+	HeartBeatsSent int64
+	// HeartBeatsReceived is the number of heart-beat frames received
+	HeartBeatsReceived int64
+	// LastHeartBeatSent is the timestamp of the last heart-beat sent
+	LastHeartBeatSent time.Time
+	// LastHeartBeatReceived is the timestamp of the last heart-beat received
+	LastHeartBeatReceived time.Time
+	// ConnectedAt is the timestamp when the connection was established
+	ConnectedAt time.Time
+	// LastError is the last error that occurred
+	LastError error
+}
+
+// CallbackTransaction represents a transaction in the callback-style client
+type CallbackTransaction struct {
+	id       string
+	conn     *CallbackConn
+	state    TransactionState
+	callback TransactionCallback
+}
+
+// Id returns the transaction ID
+func (tx *CallbackTransaction) Id() string {
+	return tx.id
+}
+
+// State returns the current transaction state
+func (tx *CallbackTransaction) State() TransactionState {
+	return tx.state
+}
+
+// Conn returns the connection associated with this transaction
+func (tx *CallbackTransaction) Conn() *CallbackConn {
+	return tx.conn
 }

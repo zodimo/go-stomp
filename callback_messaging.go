@@ -501,3 +501,134 @@ func (c *CallbackConn) createCallbackAckNackFrame(msg *CallbackMessage, ack bool
 
 	return f, nil
 }
+
+// SendTx sends a message within a transaction
+func (c *CallbackConn) SendTx(tx *CallbackTransaction, destination, contentType string, body []byte, callback SendCallback, opts ...func(*frame.Frame) error) error {
+	if tx == nil {
+		return newErrorMessage("transaction cannot be nil")
+	}
+	return tx.Send(destination, contentType, body, callback, opts...)
+}
+
+// AckTx acknowledges a message within a transaction
+func (c *CallbackConn) AckTx(tx *CallbackTransaction, message *CallbackMessage, callback AckCallback) error {
+	if tx == nil {
+		return newErrorMessage("transaction cannot be nil")
+	}
+	if tx.state != TxStateActive {
+		return ErrCompletedTransaction
+	}
+
+	if c.GetState() != Connected {
+		if callback != nil {
+			go callback(c, message.ackId, ErrNotConnected)
+		}
+		return ErrNotConnected
+	}
+
+	if !message.ShouldAck() {
+		// Nothing to acknowledge for auto-ack messages
+		if callback != nil {
+			go callback(c, message.ackId, nil)
+		}
+		return nil
+	}
+
+	// Create ACK frame using existing logic
+	f, err := c.createCallbackAckNackFrame(message, true)
+	if err != nil {
+		if callback != nil {
+			go callback(c, message.ackId, err)
+		}
+		return err
+	}
+
+	if f != nil {
+		// Add transaction header
+		f.Header.Set(frame.Transaction, tx.id)
+
+		// Send the frame
+		writer := frame.NewWriter(c.ioAdapter)
+		err = writer.Write(f)
+		if err != nil {
+			if callback != nil {
+				go callback(c, message.ackId, err)
+			}
+			return err
+		}
+
+		// Update statistics
+		c.mu.Lock()
+		c.stats.FramesSent++
+		c.mu.Unlock()
+	}
+
+	// Call the ack callback asynchronously to avoid blocking
+	if callback != nil {
+		go callback(c, message.ackId, nil)
+	}
+
+	return nil
+}
+
+// NackTx negatively acknowledges a message within a transaction
+func (c *CallbackConn) NackTx(tx *CallbackTransaction, message *CallbackMessage, callback AckCallback) error {
+	if tx == nil {
+		return newErrorMessage("transaction cannot be nil")
+	}
+	if tx.state != TxStateActive {
+		return ErrCompletedTransaction
+	}
+
+	if c.GetState() != Connected {
+		if callback != nil {
+			go callback(c, message.ackId, ErrNotConnected)
+		}
+		return ErrNotConnected
+	}
+
+	if !message.ShouldAck() {
+		// Cannot NACK auto-ack messages
+		err := ErrCannotNackAutoSub
+		if callback != nil {
+			go callback(c, message.ackId, err)
+		}
+		return err
+	}
+
+	// Create NACK frame using existing logic
+	f, err := c.createCallbackAckNackFrame(message, false)
+	if err != nil {
+		if callback != nil {
+			go callback(c, message.ackId, err)
+		}
+		return err
+	}
+
+	if f != nil {
+		// Add transaction header
+		f.Header.Set(frame.Transaction, tx.id)
+
+		// Send the frame
+		writer := frame.NewWriter(c.ioAdapter)
+		err = writer.Write(f)
+		if err != nil {
+			if callback != nil {
+				go callback(c, message.ackId, err)
+			}
+			return err
+		}
+
+		// Update statistics
+		c.mu.Lock()
+		c.stats.FramesSent++
+		c.mu.Unlock()
+	}
+
+	// Call the ack callback asynchronously to avoid blocking
+	if callback != nil {
+		go callback(c, message.ackId, nil)
+	}
+
+	return nil
+}
