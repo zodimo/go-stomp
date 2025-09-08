@@ -16,6 +16,7 @@ var (
 	ErrCompletedSubscription     = newErrorMessage("subscription is unsubscribed")
 	ErrClosedUnexpectedly        = newErrorMessage("connection closed unexpectedly")
 	ErrAlreadyClosed             = newErrorMessage("connection already closed")
+	ErrAlreadyConnected          = newErrorMessage("connection already connected")
 	ErrMsgSendTimeout            = newErrorMessage("msg send timeout")
 	ErrMsgReceiptTimeout         = newErrorMessage("msg receipt timeout")
 	ErrDisconnectReceiptTimeout  = newErrorMessage("disconnect receipt timeout")
