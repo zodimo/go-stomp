@@ -20,6 +20,7 @@ type OperationTimeoutConfig struct {
 	Unsubscribe time.Duration
 	Disconnect  time.Duration
 	Ack         time.Duration
+	Transaction time.Duration // New field for transaction operations
 }
 
 // DefaultOperationTimeouts returns default timeout values for operations
@@ -31,6 +32,7 @@ func DefaultOperationTimeouts() *OperationTimeoutConfig {
 		Unsubscribe: 10 * time.Second,
 		Disconnect:  10 * time.Second,
 		Ack:         5 * time.Second,
+		Transaction: 15 * time.Second, // Slightly longer timeout for transactions
 	}
 }
 
@@ -354,6 +356,7 @@ func (r *FrameRouter) GetOperationTimeouts() *OperationTimeoutConfig {
 		Unsubscribe: r.operationTimeouts.Unsubscribe,
 		Disconnect:  r.operationTimeouts.Disconnect,
 		Ack:         r.operationTimeouts.Ack,
+		Transaction: r.operationTimeouts.Transaction,
 	}
 }
 
@@ -1029,7 +1032,7 @@ func (c *CallbackConn) Disconnect(disconnectCallback DisconnectCallback) error {
 func (c *CallbackConn) registerAndWaitForReceipt(opType string, receiptId string, timeout time.Duration) (chan *frame.Frame, chan error, context.CancelFunc, error) {
 	// Create context with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	
+
 	// Create channels for response and error
 	responseCh := make(chan *frame.Frame, 1)
 	errorCh := make(chan error, 1)
@@ -1266,8 +1269,9 @@ func (c *CallbackConn) Begin(callback TransactionCallback) (*CallbackTransaction
 		return nil, ErrNotConnected
 	}
 
-	// Generate transaction ID
+	// Generate transaction ID and receipt ID
 	id := allocateId()
+	receiptId := allocateId()
 
 	// Create transaction
 	tx := &CallbackTransaction{
@@ -1277,20 +1281,34 @@ func (c *CallbackConn) Begin(callback TransactionCallback) (*CallbackTransaction
 		callback: callback,
 	}
 
+	// Register operation BEFORE sending frame to prevent race condition
+	responseCh, errorCh, _, err := c.registerAndWaitForReceipt("begin", receiptId, c.frameRouter.operationTimeouts.Transaction)
+	if err != nil {
+		if callback != nil {
+			go callback(c, tx, TransactionError, err)
+		}
+		return nil, err
+	}
+
 	// Store transaction
 	c.mu.Lock()
 	c.transactions[id] = tx
 	c.mu.Unlock()
 
-	// Create and send BEGIN frame
-	beginFrame := frame.New(frame.BEGIN, frame.Transaction, id)
+	// Create and send BEGIN frame with receipt
+	beginFrame := frame.New(frame.BEGIN, frame.Transaction, id, frame.Receipt, receiptId)
 	writer := frame.NewUnwrapCbioWriter(c.conn)
-	err := writer.WriteSync(beginFrame)
+	err = writer.WriteSync(beginFrame)
 	if err != nil {
+		// Unregister pending operation on send failure
+		c.frameRouter.UnregisterPendingOperation(receiptId)
 		// Remove transaction from map on error
 		c.mu.Lock()
 		delete(c.transactions, id)
 		c.mu.Unlock()
+		if callback != nil {
+			go callback(c, tx, TransactionError, err)
+		}
 		return nil, err
 	}
 
@@ -1299,10 +1317,34 @@ func (c *CallbackConn) Begin(callback TransactionCallback) (*CallbackTransaction
 	c.stats.FramesSent++
 	c.mu.Unlock()
 
-	// Notify callback asynchronously
-	if callback != nil {
-		go callback(c, tx, TransactionBegan, nil)
-	}
+	// Wait for receipt or error asynchronously
+	go func() {
+		select {
+		case <-responseCh:
+			// Receipt received, transaction begin successful
+			if callback != nil {
+				callback(c, tx, TransactionBegan, nil)
+			}
+		case err := <-errorCh:
+			// Error occurred
+			c.mu.Lock()
+			delete(c.transactions, id)
+			c.mu.Unlock()
+			if callback != nil {
+				callback(c, tx, TransactionError, err)
+			}
+		case <-time.After(c.frameRouter.operationTimeouts.Transaction):
+			// Timeout occurred
+			c.frameRouter.UnregisterPendingOperation(receiptId)
+			c.mu.Lock()
+			delete(c.transactions, id)
+			c.mu.Unlock()
+			err := ErrTransactionTimeout
+			if callback != nil {
+				callback(c, tx, TransactionError, err)
+			}
+		}
+	}()
 
 	return tx, nil
 }

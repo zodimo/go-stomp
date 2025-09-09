@@ -25,6 +25,12 @@ var (
 	ErrNotConnected              = newErrorMessage("not connected")
 	ErrInvalidSubscription       = newErrorMessage("invalid subscription")
 	ErrNilOption                 = newErrorMessage("nil option")
+	
+	// Transaction-specific errors
+	ErrTransactionTimeout        = newErrorMessage("transaction operation timed out")
+	ErrTransactionBeginFailed    = newErrorMessage("transaction begin failed")
+	ErrTransactionCommitFailed   = newErrorMessage("transaction commit failed")
+	ErrTransactionAbortFailed    = newErrorMessage("transaction abort failed")
 )
 
 // StompError implements the Error interface, and provides

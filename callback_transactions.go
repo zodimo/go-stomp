@@ -17,7 +17,10 @@ func (tx *CallbackTransaction) Commit(callback TransactionCallback) error {
 	commitFrame := frame.New(frame.COMMIT, frame.Transaction, tx.id, frame.Receipt, receiptId)
 
 	// Register operation BEFORE sending frame to prevent race condition
-	responseCh, errorCh, cancel, err := tx.conn.registerAndWaitForReceipt("commit", receiptId, tx.conn.frameRouter.operationTimeouts.Send)
+	responseCh, errorCh, cancel, err := tx.conn.registerAndWaitForReceipt(
+		"commit",
+		receiptId,
+		tx.conn.frameRouter.operationTimeouts.Transaction) // Use transaction timeout
 	if err != nil {
 		if callback != nil {
 			go callback(tx.conn, tx, TransactionError, err)
@@ -38,12 +41,8 @@ func (tx *CallbackTransaction) Commit(callback TransactionCallback) error {
 		return err
 	}
 
-	// Update transaction state
-	tx.state = TxStateCommitted
-
-	// Remove transaction from connection map
+	// Update statistics
 	tx.conn.mu.Lock()
-	delete(tx.conn.transactions, tx.id)
 	tx.conn.stats.FramesSent++
 	tx.conn.mu.Unlock()
 
@@ -51,6 +50,12 @@ func (tx *CallbackTransaction) Commit(callback TransactionCallback) error {
 	select {
 	case <-responseCh:
 		// Receipt received, commit successful
+		// Only update transaction state and remove from map AFTER receipt confirmation
+		tx.state = TxStateCommitted
+		tx.conn.mu.Lock()
+		delete(tx.conn.transactions, tx.id)
+		tx.conn.mu.Unlock()
+
 		if callback != nil {
 			go callback(tx.conn, tx, TransactionCommitted, nil)
 		}
@@ -60,10 +65,10 @@ func (tx *CallbackTransaction) Commit(callback TransactionCallback) error {
 			go callback(tx.conn, tx, TransactionError, err)
 		}
 		return err
-	case <-time.After(tx.conn.frameRouter.operationTimeouts.Send):
+	case <-time.After(tx.conn.frameRouter.operationTimeouts.Transaction): // Use transaction timeout
 		// Timeout occurred
 		tx.conn.frameRouter.UnregisterPendingOperation(receiptId)
-		err := ErrSendReceiptTimeout
+		err := ErrTransactionTimeout // Use specific transaction timeout error
 		if callback != nil {
 			go callback(tx.conn, tx, TransactionError, err)
 		}
@@ -84,7 +89,10 @@ func (tx *CallbackTransaction) Abort(callback TransactionCallback) error {
 	abortFrame := frame.New(frame.ABORT, frame.Transaction, tx.id, frame.Receipt, receiptId)
 
 	// Register operation BEFORE sending frame to prevent race condition
-	responseCh, errorCh, cancel, err := tx.conn.registerAndWaitForReceipt("abort", receiptId, tx.conn.frameRouter.operationTimeouts.Send)
+	responseCh, errorCh, cancel, err := tx.conn.registerAndWaitForReceipt(
+		"abort",
+		receiptId,
+		tx.conn.frameRouter.operationTimeouts.Transaction) // Use transaction timeout
 	if err != nil {
 		if callback != nil {
 			go callback(tx.conn, tx, TransactionError, err)
@@ -105,12 +113,8 @@ func (tx *CallbackTransaction) Abort(callback TransactionCallback) error {
 		return err
 	}
 
-	// Update transaction state
-	tx.state = TxStateAborted
-
-	// Remove transaction from connection map
+	// Update statistics
 	tx.conn.mu.Lock()
-	delete(tx.conn.transactions, tx.id)
 	tx.conn.stats.FramesSent++
 	tx.conn.mu.Unlock()
 
@@ -118,6 +122,12 @@ func (tx *CallbackTransaction) Abort(callback TransactionCallback) error {
 	select {
 	case <-responseCh:
 		// Receipt received, abort successful
+		// Only update transaction state and remove from map AFTER receipt confirmation
+		tx.state = TxStateAborted
+		tx.conn.mu.Lock()
+		delete(tx.conn.transactions, tx.id)
+		tx.conn.mu.Unlock()
+
 		if callback != nil {
 			go callback(tx.conn, tx, TransactionAborted, nil)
 		}
@@ -127,10 +137,10 @@ func (tx *CallbackTransaction) Abort(callback TransactionCallback) error {
 			go callback(tx.conn, tx, TransactionError, err)
 		}
 		return err
-	case <-time.After(tx.conn.frameRouter.operationTimeouts.Send):
+	case <-time.After(tx.conn.frameRouter.operationTimeouts.Transaction): // Use transaction timeout
 		// Timeout occurred
 		tx.conn.frameRouter.UnregisterPendingOperation(receiptId)
-		err := ErrSendReceiptTimeout
+		err := ErrTransactionTimeout // Use specific transaction timeout error
 		if callback != nil {
 			go callback(tx.conn, tx, TransactionError, err)
 		}
