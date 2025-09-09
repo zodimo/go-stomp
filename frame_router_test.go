@@ -503,3 +503,185 @@ func (s *FrameRouterSuite) TestTimeoutCleanup(c *C) {
 		c.Fatal("Expected timeout error not received")
 	}
 }
+
+// Test the registerAndWaitForReceipt helper method
+func (s *FrameRouterSuite) TestRegisterAndWaitForReceipt(c *C) {
+	client, _ := NewFakeConn()
+	cbioConn := cbio.WrapReadWriteCloser(client)
+	conn := NewCallbackConn(cbioConn)
+
+	// Test successful registration
+	receiptId := allocateId()
+	responseCh, errorCh, cancel, err := conn.registerAndWaitForReceipt("test", receiptId, 100*time.Millisecond)
+	defer cancel()
+
+	c.Assert(err, IsNil)
+	c.Assert(responseCh, NotNil)
+	c.Assert(errorCh, NotNil)
+
+	// Verify operation was registered
+	conn.frameRouter.mu.RLock()
+	op, exists := conn.frameRouter.pendingOps[receiptId]
+	conn.frameRouter.mu.RUnlock()
+
+	c.Assert(exists, Equals, true)
+	c.Assert(op.Type, Equals, "test")
+	c.Assert(op.ReceiptID, Equals, receiptId)
+
+	// Test duplicate registration
+	_, _, cancel2, err := conn.registerAndWaitForReceipt("test", receiptId, 100*time.Millisecond)
+	defer cancel2()
+
+	c.Assert(err, NotNil)
+	c.Assert(err.Error(), Matches, ".*already exists.*")
+}
+
+// Test the race condition fix by ensuring operations are registered before frames are sent
+func (s *FrameRouterSuite) TestOperationRegistrationBeforeSending(c *C) {
+	client, server := NewFakeConn()
+	cbioClient := cbio.WrapReadWriteCloser(client)
+	cbioServer := cbio.WrapReadWriteCloser(server)
+	conn := NewCallbackConn(cbioClient)
+
+	// Set up a goroutine to simulate a server that responds immediately with a receipt
+	go func() {
+		reader := frame.NewUnwrapCbioReader(cbioServer)
+		writer := frame.NewUnwrapCbioWriter(cbioServer)
+
+		// Read the frame sent by the client
+		f, err := reader.ReadSync()
+		c.Assert(err, IsNil)
+		c.Assert(f.Command, Equals, frame.DISCONNECT)
+
+		// Get the receipt-id
+		receiptId := f.Header.Get(frame.Receipt)
+		c.Assert(receiptId, Not(Equals), "")
+
+		// Send receipt immediately
+		receiptFrame := frame.New(frame.RECEIPT, frame.ReceiptId, receiptId)
+		err = writer.WriteSync(receiptFrame)
+		c.Assert(err, IsNil)
+	}()
+
+	// Set up a disconnect callback to track completion
+	disconnectCompleted := make(chan error, 1)
+	conn.Disconnect(func(_ *CallbackConn, err error) {
+		disconnectCompleted <- err
+	})
+
+	// Wait for disconnect to complete
+	select {
+	case err := <-disconnectCompleted:
+		c.Assert(err, IsNil)
+	case <-time.After(1 * time.Second):
+		c.Fatal("Disconnect operation timed out")
+	}
+}
+
+// Test proper handling of late receipts (arriving after timeout)
+func (s *FrameRouterSuite) TestLateReceiptHandling(c *C) {
+	client, server := NewFakeConn()
+	cbioClient := cbio.WrapReadWriteCloser(client)
+	cbioServer := cbio.WrapReadWriteCloser(server)
+	conn := NewCallbackConn(cbioClient)
+
+	// Set a very short timeout for disconnect
+	conn.disconnectReceiptTimeout = 50 * time.Millisecond
+
+	// Set up a goroutine to simulate a server that responds with a delay
+	go func() {
+		reader := frame.NewUnwrapCbioReader(cbioServer)
+		writer := frame.NewUnwrapCbioWriter(cbioServer)
+
+		// Read the frame sent by the client
+		f, err := reader.ReadSync()
+		c.Assert(err, IsNil)
+		c.Assert(f.Command, Equals, frame.DISCONNECT)
+
+		// Get the receipt-id
+		receiptId := f.Header.Get(frame.Receipt)
+		c.Assert(receiptId, Not(Equals), "")
+
+		// Wait longer than the timeout before sending receipt
+		time.Sleep(100 * time.Millisecond)
+
+		// Send receipt after timeout
+		receiptFrame := frame.New(frame.RECEIPT, frame.ReceiptId, receiptId)
+		err = writer.WriteSync(receiptFrame)
+		c.Assert(err, IsNil)
+	}()
+
+	// Set up a disconnect callback to track completion
+	disconnectCompleted := make(chan error, 1)
+	conn.Disconnect(func(_ *CallbackConn, err error) {
+		disconnectCompleted <- err
+	})
+
+	// Wait for disconnect to complete with timeout error
+	select {
+	case err := <-disconnectCompleted:
+		c.Assert(err, Equals, ErrDisconnectReceiptTimeout)
+	case <-time.After(1 * time.Second):
+		c.Fatal("Disconnect operation didn't complete")
+	}
+}
+
+// Test transaction operations with receipt handling
+func (s *FrameRouterSuite) TestTransactionOperationsWithReceipt(c *C) {
+	client, server := NewFakeConn()
+	cbioClient := cbio.WrapReadWriteCloser(client)
+	cbioServer := cbio.WrapReadWriteCloser(server)
+	conn := NewCallbackConn(cbioClient)
+
+	// Set up connection state to Connected for transaction operations
+	conn.setState(Connected)
+
+	// Set up a goroutine to simulate a server that responds to transaction operations
+	go func() {
+		reader := frame.NewUnwrapCbioReader(cbioServer)
+		writer := frame.NewUnwrapCbioWriter(cbioServer)
+
+		// Handle BEGIN frame
+		beginFrame, err := reader.ReadSync()
+		c.Assert(err, IsNil)
+		c.Assert(beginFrame.Command, Equals, frame.BEGIN)
+
+		// Handle COMMIT frame with receipt
+		commitFrame, err := reader.ReadSync()
+		c.Assert(err, IsNil)
+		c.Assert(commitFrame.Command, Equals, frame.COMMIT)
+
+		// Get the receipt-id from COMMIT frame
+		receiptId := commitFrame.Header.Get(frame.Receipt)
+		c.Assert(receiptId, Not(Equals), "")
+
+		// Send receipt immediately
+		receiptFrame := frame.New(frame.RECEIPT, frame.ReceiptId, receiptId)
+		err = writer.WriteSync(receiptFrame)
+		c.Assert(err, IsNil)
+	}()
+
+	// Create transaction
+	txCompleted := make(chan error, 1)
+	tx, err := conn.Begin(nil)
+	c.Assert(err, IsNil)
+	c.Assert(tx, NotNil)
+
+	// Commit transaction with callback
+	err = tx.Commit(func(_ *CallbackConn, _ *CallbackTransaction, event TransactionEvent, err error) {
+		if event == TransactionCommitted {
+			txCompleted <- nil
+		} else if event == TransactionError {
+			txCompleted <- err
+		}
+	})
+	c.Assert(err, IsNil)
+
+	// Wait for transaction to complete
+	select {
+	case err := <-txCompleted:
+		c.Assert(err, IsNil)
+	case <-time.After(1 * time.Second):
+		c.Fatal("Transaction commit operation timed out")
+	}
+}

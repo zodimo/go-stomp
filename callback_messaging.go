@@ -1,7 +1,6 @@
 package stomp
 
 import (
-	"context"
 	"time"
 
 	"github.com/go-stomp/stomp/v3/frame"
@@ -98,31 +97,15 @@ func (c *CallbackConn) performSendWithReceipt(f *frame.Frame, destination, recei
 	// Create frame writer using the standard io adapter
 	writer := frame.NewUnwrapCbioWriter(c.conn)
 
-	// Create pending operation for receipt tracking
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	responseCh := make(chan *frame.Frame, 1)
-	errorCh := make(chan error, 1)
-
-	pendingOp := &PendingOperation{
-		Type:       "send",
-		ReceiptID:  receiptId,
-		ResponseCh: responseCh,
-		ErrorCh:    errorCh,
-		Context:    ctx,
-		Cancel:     cancel,
-	}
-
-	// Register pending operation with frame router
-	var err error
-	err = c.frameRouter.RegisterPendingOperation(pendingOp)
+	// Register operation BEFORE sending frame to prevent race condition
+	responseCh, errorCh, cancel, err := c.registerAndWaitForReceipt("send", receiptId, timeout)
 	if err != nil {
 		c.notifySendCallback(destination, err)
 		return
 	}
+	defer cancel()
 
-	// Send SEND frame
+	// Send SEND frame AFTER registering operation
 	err = writer.WriteSync(f)
 	if err != nil {
 		// Unregister pending operation on send failure
@@ -139,7 +122,7 @@ func (c *CallbackConn) performSendWithReceipt(f *frame.Frame, destination, recei
 	case err := <-errorCh:
 		// Error occurred
 		c.notifySendCallback(destination, err)
-	case <-ctx.Done():
+	case <-time.After(timeout):
 		// Timeout occurred, unregister the operation
 		c.frameRouter.UnregisterPendingOperation(receiptId)
 		c.notifySendCallback(destination, ErrSendReceiptTimeout)
@@ -289,31 +272,15 @@ func (c *CallbackConn) performUnsubscribe(unsubscribeFrame *frame.Frame, subscri
 	// Create frame writer using the standard io adapter
 	writer := frame.NewUnwrapCbioWriter(c.conn)
 
-	// Create pending operation for receipt tracking
-	ctx, cancel := context.WithTimeout(context.Background(), c.unsubscribeReceiptTimeout)
-	defer cancel()
-
-	responseCh := make(chan *frame.Frame, 1)
-	errorCh := make(chan error, 1)
-
-	pendingOp := &PendingOperation{
-		Type:       "unsubscribe",
-		ReceiptID:  receiptId,
-		ResponseCh: responseCh,
-		ErrorCh:    errorCh,
-		Context:    ctx,
-		Cancel:     cancel,
-	}
-
-	// Register pending operation with frame router
-	var err error
-	err = c.frameRouter.RegisterPendingOperation(pendingOp)
+	// Register operation BEFORE sending frame to prevent race condition
+	responseCh, errorCh, cancel, err := c.registerAndWaitForReceipt("unsubscribe", receiptId, c.unsubscribeReceiptTimeout)
 	if err != nil {
 		c.notifySubscriptionCallback(subscription, SubscriptionError, err)
 		return
 	}
+	defer cancel()
 
-	// Send UNSUBSCRIBE frame
+	// Send UNSUBSCRIBE frame AFTER registering operation
 	err = writer.WriteSync(unsubscribeFrame)
 	if err != nil {
 		// Unregister pending operation on send failure
@@ -331,7 +298,7 @@ func (c *CallbackConn) performUnsubscribe(unsubscribeFrame *frame.Frame, subscri
 	case err := <-errorCh:
 		// Error occurred
 		c.notifySubscriptionCallback(subscription, SubscriptionError, err)
-	case <-ctx.Done():
+	case <-time.After(c.unsubscribeReceiptTimeout):
 		// Timeout occurred, unregister the operation
 		c.frameRouter.UnregisterPendingOperation(receiptId)
 		c.notifySubscriptionCallback(subscription, SubscriptionError, ErrUnsubscribeReceiptTimeout)

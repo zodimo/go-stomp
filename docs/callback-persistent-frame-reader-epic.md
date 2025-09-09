@@ -63,11 +63,11 @@ Implement a **persistent background frame reader** that continuously reads frame
 
 #### Story 2.4: Operation Timing and Race Condition Resolution
 **Acceptance Criteria:**
-- [ ] Fix race condition between frame sending and operation registration
-- [ ] Ensure operations are registered before frames are sent to server
-- [ ] Implement proper synchronization for disconnect operation
-- [ ] Fix connection state transitions during disconnect
-- [ ] Ensure RECEIPT frames are properly matched to pending operations
+- [x] Fix race condition between frame sending and operation registration
+- [x] Ensure operations are registered before frames are sent to server
+- [x] Implement proper synchronization for disconnect operation
+- [x] Fix connection state transitions during disconnect
+- [x] Ensure RECEIPT frames are properly matched to pending operations
 
 **Technical Details:**
 - Reorder operation registration to occur before frame transmission
@@ -83,6 +83,30 @@ Implement a **persistent background frame reader** that continuously reads frame
 - Unit tests failing with connection stuck in "Disconnecting" state
 - Disconnect callbacks not being triggered
 - RECEIPT frames marked as "unknown receipt-id"
+
+**Status:** ✅ COMPLETED
+
+#### Story 2.5: Transaction Operation Synchronization and Integration Test Fixes
+**Acceptance Criteria:**
+- [ ] Fix transaction commit and abort operation synchronization
+- [ ] Ensure transaction receipts are properly handled
+- [ ] Fix integration test failures related to transaction operations
+- [ ] Ensure all integration tests pass without timeouts
+- [ ] Add comprehensive transaction operation tests
+
+**Technical Details:**
+- Apply the pre-registration pattern to all transaction operations
+- Fix receipt handling for transaction operations
+- Enhance transaction state management
+- Add proper timeout handling for transaction operations
+- Update integration tests to verify transaction operations
+
+**Root Cause:** While Story 2.4 fixed the general race condition pattern, there are still specific issues with transaction operations. The integration tests are failing with "send receipt timeout" errors for transaction commits, indicating that receipt frames for transaction operations are not being properly handled.
+
+**Impact:**
+- Integration tests failing with "send receipt timeout" for transaction operations
+- Transaction callbacks not being triggered properly
+- Potential data inconsistency with failed transactions
 
 ### Phase 3: Operation Implementation (Medium Priority)
 
@@ -113,11 +137,12 @@ Implement a **persistent background frame reader** that continuously reads frame
 - [ ] Handle transaction-related frames properly
 - [ ] Maintain transaction state consistency
 
-#### Story 2.5: Refactor Disconnect Operation
+#### Story 3.5: Refactor Error Handling
 **Acceptance Criteria:**
-- [ ] Remove temporary reader from disconnect operation
-- [ ] Ensure proper cleanup of frame reader on disconnect
-- [ ] Handle RECEIPT response for disconnect
+- [ ] Implement comprehensive error handling for all operations
+- [ ] Add detailed error reporting through callbacks
+- [ ] Ensure proper error propagation
+- [ ] Add error recovery mechanisms
 
 ### Phase 4: Advanced Features (Low Priority)
 
@@ -205,10 +230,10 @@ func (r *FrameRouter) routeFrame(frame *frame.Frame)
 
 ## Success Metrics
 
-- [ ] All integration tests pass without timeouts ⚠️ **FAILING** - Story 2.4 needed
+- [ ] All integration tests pass without timeouts ⚠️ **PARTIALLY FIXED** - Story 2.5 needed for transaction operations
 - [x] No race conditions in concurrent operations ✅ **COMPLETED** - Story 2.3
-- [ ] RECEIPT frames are properly received and handled ⚠️ **FAILING** - Story 2.4 needed
-- [x] Connection state remains consistent ✅ **MOSTLY COMPLETED** - Some issues remain in Story 2.4
+- [x] RECEIPT frames are properly received and handled ✅ **COMPLETED** - Story 2.4
+- [x] Connection state remains consistent ✅ **COMPLETED** - Story 2.4
 - [x] Performance is comparable to or better than current implementation ✅ **COMPLETED** 
 - [x] Memory usage is reasonable (no memory leaks from pending operations) ✅ **COMPLETED** - Story 2.3
 
@@ -243,10 +268,10 @@ func (r *FrameRouter) routeFrame(frame *frame.Frame)
 
 ## Definition of Done
 
-- [ ] All unit tests pass
-- [ ] All integration tests pass without timeouts
-- [ ] Code review completed
-- [ ] Documentation updated
-- [ ] Performance benchmarks meet requirements
-- [ ] No regressions in existing functionality
-- [ ] Memory leak testing completed
+- [x] All unit tests pass
+- [ ] All integration tests pass without timeouts (Story 2.5 needed)
+- [x] Code review completed for Stories 2.1-2.4
+- [x] Documentation updated for Stories 2.1-2.4
+- [x] Performance benchmarks meet requirements
+- [x] No regressions in existing functionality
+- [x] Memory leak testing completed

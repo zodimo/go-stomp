@@ -1,6 +1,8 @@
 package stomp
 
 import (
+	"time"
+
 	"github.com/go-stomp/stomp/v3/frame"
 )
 
@@ -11,11 +13,25 @@ func (tx *CallbackTransaction) Commit(callback TransactionCallback) error {
 	}
 
 	// Create COMMIT frame
-	commitFrame := frame.New(frame.COMMIT, frame.Transaction, tx.id)
-	writer := frame.NewUnwrapCbioWriter(tx.conn.conn)
-	err := writer.WriteSync(commitFrame)
+	receiptId := allocateId()
+	commitFrame := frame.New(frame.COMMIT, frame.Transaction, tx.id, frame.Receipt, receiptId)
+
+	// Register operation BEFORE sending frame to prevent race condition
+	responseCh, errorCh, cancel, err := tx.conn.registerAndWaitForReceipt("commit", receiptId, tx.conn.frameRouter.operationTimeouts.Send)
 	if err != nil {
-		// Notify error
+		if callback != nil {
+			go callback(tx.conn, tx, TransactionError, err)
+		}
+		return err
+	}
+	defer cancel()
+
+	// Send COMMIT frame AFTER registering operation
+	writer := frame.NewUnwrapCbioWriter(tx.conn.conn)
+	err = writer.WriteSync(commitFrame)
+	if err != nil {
+		// Unregister pending operation on send failure
+		tx.conn.frameRouter.UnregisterPendingOperation(receiptId)
 		if callback != nil {
 			go callback(tx.conn, tx, TransactionError, err)
 		}
@@ -31,9 +47,27 @@ func (tx *CallbackTransaction) Commit(callback TransactionCallback) error {
 	tx.conn.stats.FramesSent++
 	tx.conn.mu.Unlock()
 
-	// Notify success
-	if callback != nil {
-		go callback(tx.conn, tx, TransactionCommitted, nil)
+	// Wait for receipt or error
+	select {
+	case <-responseCh:
+		// Receipt received, commit successful
+		if callback != nil {
+			go callback(tx.conn, tx, TransactionCommitted, nil)
+		}
+	case err := <-errorCh:
+		// Error occurred
+		if callback != nil {
+			go callback(tx.conn, tx, TransactionError, err)
+		}
+		return err
+	case <-time.After(tx.conn.frameRouter.operationTimeouts.Send):
+		// Timeout occurred
+		tx.conn.frameRouter.UnregisterPendingOperation(receiptId)
+		err := ErrSendReceiptTimeout
+		if callback != nil {
+			go callback(tx.conn, tx, TransactionError, err)
+		}
+		return err
 	}
 
 	return nil
@@ -46,11 +80,25 @@ func (tx *CallbackTransaction) Abort(callback TransactionCallback) error {
 	}
 
 	// Create ABORT frame
-	abortFrame := frame.New(frame.ABORT, frame.Transaction, tx.id)
-	writer := frame.NewUnwrapCbioWriter(tx.conn.conn)
-	err := writer.WriteSync(abortFrame)
+	receiptId := allocateId()
+	abortFrame := frame.New(frame.ABORT, frame.Transaction, tx.id, frame.Receipt, receiptId)
+
+	// Register operation BEFORE sending frame to prevent race condition
+	responseCh, errorCh, cancel, err := tx.conn.registerAndWaitForReceipt("abort", receiptId, tx.conn.frameRouter.operationTimeouts.Send)
 	if err != nil {
-		// Notify error
+		if callback != nil {
+			go callback(tx.conn, tx, TransactionError, err)
+		}
+		return err
+	}
+	defer cancel()
+
+	// Send ABORT frame AFTER registering operation
+	writer := frame.NewUnwrapCbioWriter(tx.conn.conn)
+	err = writer.WriteSync(abortFrame)
+	if err != nil {
+		// Unregister pending operation on send failure
+		tx.conn.frameRouter.UnregisterPendingOperation(receiptId)
 		if callback != nil {
 			go callback(tx.conn, tx, TransactionError, err)
 		}
@@ -66,9 +114,27 @@ func (tx *CallbackTransaction) Abort(callback TransactionCallback) error {
 	tx.conn.stats.FramesSent++
 	tx.conn.mu.Unlock()
 
-	// Notify success
-	if callback != nil {
-		go callback(tx.conn, tx, TransactionAborted, nil)
+	// Wait for receipt or error
+	select {
+	case <-responseCh:
+		// Receipt received, abort successful
+		if callback != nil {
+			go callback(tx.conn, tx, TransactionAborted, nil)
+		}
+	case err := <-errorCh:
+		// Error occurred
+		if callback != nil {
+			go callback(tx.conn, tx, TransactionError, err)
+		}
+		return err
+	case <-time.After(tx.conn.frameRouter.operationTimeouts.Send):
+		// Timeout occurred
+		tx.conn.frameRouter.UnregisterPendingOperation(receiptId)
+		err := ErrSendReceiptTimeout
+		if callback != nil {
+			go callback(tx.conn, tx, TransactionError, err)
+		}
+		return err
 	}
 
 	return nil

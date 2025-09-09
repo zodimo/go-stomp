@@ -155,6 +155,9 @@ func (r *FrameRouter) routeReceiptFrame(f *frame.Frame) {
 	r.mu.Lock()
 	op, exists := r.pendingOps[receiptID]
 	if exists {
+		if r.conn.log != nil {
+			r.conn.log.Debugf("matched RECEIPT frame to %s operation with receipt %s", op.Type, receiptID)
+		}
 		delete(r.pendingOps, receiptID)
 	}
 	r.mu.Unlock()
@@ -163,12 +166,22 @@ func (r *FrameRouter) routeReceiptFrame(f *frame.Frame) {
 		select {
 		case op.ResponseCh <- f:
 			// Receipt delivered successfully
+			if r.conn.log != nil {
+				r.conn.log.Debugf("delivered RECEIPT frame to %s operation", op.Type)
+			}
+		case <-op.Context.Done():
+			// Operation already timed out or cancelled
+			if r.conn.log != nil {
+				r.conn.log.Warningf("operation with receipt %s already timed out or cancelled", receiptID)
+			}
 		default:
 			// Channel full or closed, log warning
-			r.conn.log.Warning("Failed to deliver RECEIPT frame to pending operation")
+			r.conn.log.Warning("failed to deliver RECEIPT frame to pending operation - channel full or closed")
 		}
 	} else {
-		r.conn.log.Warning("Received RECEIPT frame for unknown receipt-id: " + receiptID)
+		// This could be due to race condition where the receipt arrives after operation timeout
+		// or the operation was never registered
+		r.conn.log.Warningf("received RECEIPT frame for unknown receipt-id: %s", receiptID)
 	}
 }
 
@@ -1012,6 +1025,35 @@ func (c *CallbackConn) Disconnect(disconnectCallback DisconnectCallback) error {
 	return nil
 }
 
+// registerAndWaitForReceipt is a helper method that registers an operation and waits for receipt
+func (c *CallbackConn) registerAndWaitForReceipt(opType string, receiptId string, timeout time.Duration) (chan *frame.Frame, chan error, context.CancelFunc, error) {
+	// Create context with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	
+	// Create channels for response and error
+	responseCh := make(chan *frame.Frame, 1)
+	errorCh := make(chan error, 1)
+
+	// Create pending operation
+	pendingOp := &PendingOperation{
+		Type:       opType,
+		ReceiptID:  receiptId,
+		ResponseCh: responseCh,
+		ErrorCh:    errorCh,
+		Context:    ctx,
+		Cancel:     cancel,
+	}
+
+	// Register pending operation with frame router
+	err := c.frameRouter.RegisterPendingOperation(pendingOp)
+	if err != nil {
+		cancel()
+		return nil, nil, nil, err
+	}
+
+	return responseCh, errorCh, cancel, nil
+}
+
 // performDisconnect handles the actual disconnection process
 func (c *CallbackConn) performDisconnect() {
 	// Create frame writer using the standard io adapter
@@ -1021,32 +1063,19 @@ func (c *CallbackConn) performDisconnect() {
 	receiptId := allocateId()
 	disconnectFrame := frame.New(frame.DISCONNECT, frame.Receipt, receiptId)
 
-	// Send DISCONNECT frame
-	err := writer.WriteSync(disconnectFrame)
+	// IMPORTANT: Register operation BEFORE sending frame to prevent race condition
+	responseCh, errorCh, cancel, err := c.registerAndWaitForReceipt("disconnect", receiptId, c.disconnectReceiptTimeout)
 	if err != nil {
 		c.finalizeDisconnect(err)
 		return
 	}
-
-	// Create pending operation for receipt tracking
-	ctx, cancel := context.WithTimeout(context.Background(), c.disconnectReceiptTimeout)
 	defer cancel()
 
-	responseCh := make(chan *frame.Frame, 1)
-	errorCh := make(chan error, 1)
-
-	pendingOp := &PendingOperation{
-		Type:       "disconnect",
-		ReceiptID:  receiptId,
-		ResponseCh: responseCh,
-		ErrorCh:    errorCh,
-		Context:    ctx,
-		Cancel:     cancel,
-	}
-
-	// Register pending operation with frame router
-	err = c.frameRouter.RegisterPendingOperation(pendingOp)
+	// Send DISCONNECT frame AFTER registering operation
+	err = writer.WriteSync(disconnectFrame)
 	if err != nil {
+		// Unregister the operation on send failure
+		c.frameRouter.UnregisterPendingOperation(receiptId)
 		c.finalizeDisconnect(err)
 		return
 	}
@@ -1059,7 +1088,7 @@ func (c *CallbackConn) performDisconnect() {
 	case err := <-errorCh:
 		// Error occurred
 		c.finalizeDisconnect(err)
-	case <-ctx.Done():
+	case <-time.After(c.disconnectReceiptTimeout):
 		// Timeout occurred, unregister the operation
 		c.frameRouter.UnregisterPendingOperation(receiptId)
 		c.finalizeDisconnect(ErrDisconnectReceiptTimeout)
@@ -1068,11 +1097,18 @@ func (c *CallbackConn) performDisconnect() {
 
 // finalizeDisconnect completes the disconnection process
 func (c *CallbackConn) finalizeDisconnect(err error) {
-	// Stop the background frame reader
-	c.stopFrameReader()
+	// Ensure we're still in the Disconnecting state
+	currentState := c.GetState()
+	if currentState != Disconnecting {
+		c.log.Debugf("finalizeDisconnect called while in %s state", currentState)
+	}
 
-	// Stop the frame router
+	// Stop the frame router first to prevent any new operations from being registered
+	// and to ensure all pending operations are properly cleaned up
 	c.frameRouter.Stop()
+
+	// Then stop the background frame reader
+	c.stopFrameReader()
 
 	// Close the underlying connection
 	if closeErr := c.conn.Close(); closeErr != nil && err == nil {
